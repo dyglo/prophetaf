@@ -913,6 +913,9 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
   let spinnerTimer = null;
   let spinnerRunning = true;
   let streamedRawText = "";
+  let planSteps = [];
+  let renderedPlan = false;
+  let validationFlags = [];
 
   const clearSpinnerTimer = () => {
     if (spinnerTimer !== null) {
@@ -959,6 +962,13 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
         }
         renderedPrefix = renderedPrefix || sawReasoning;
         streamedRawText += eventPayload.delta;
+      } else if (!sawChunk && !sawReasoning && eventName === "plan") {
+        planSteps = normalizePlanSteps(eventPayload);
+        if (planSteps.length > 0 && !renderedPlan) {
+          stopSpinner();
+          renderPlanBlock(stream, planSteps, supportsStyle(stream));
+          renderedPlan = true;
+        }
       } else if (!sawChunk && eventName === "step" && eventPayload && typeof eventPayload.message === "string") {
         stopSpinner();
         spinner.setLabel(eventPayload.message);
@@ -966,8 +976,14 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
       } else if (!sawChunk && eventName === "reasoning" && eventPayload && typeof eventPayload.message === "string") {
         stopSpinner();
         sawReasoning = true;
+        if (planSteps.length > 0 && !renderedPlan) {
+          renderPlanBlock(stream, planSteps, supportsStyle(stream));
+          renderedPlan = true;
+        }
         renderReasoningLine(stream, eventPayload.message, supportsStyle(stream));
         scheduleSpinner();
+      } else if (eventName === "validation") {
+        validationFlags = normalizeValidationFlags(eventPayload);
       } else if (eventName === "done") {
         stopSpinner();
         donePayload = eventPayload;
@@ -995,7 +1011,14 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
   if (sawChunk && donePayload && typeof donePayload.message !== "string" && streamedRawText) {
     donePayload = { ...donePayload, message: streamedRawText };
   }
-  return { ...(donePayload || { message: streamedRawText || "" }), __streamed: false };
+  const finalPayload = { ...(donePayload || { message: streamedRawText || "" }) };
+  const finalValidationFlags = normalizeValidationFlags(finalPayload);
+  if (finalValidationFlags.length > 0) {
+    finalPayload.validation_flags = finalValidationFlags;
+  } else if (validationFlags.length > 0) {
+    finalPayload.validation_flags = validationFlags;
+  }
+  return { ...finalPayload, __streamed: false };
 }
 
 async function requestJsonWithSpinner(fetchImpl, stream, path, payload, options = {}) {
@@ -1074,6 +1097,91 @@ function formatMarkdownMessage(message, options = {}) {
       return restoreInlineSegments(value, segments, styled);
     })
     .join("\n");
+}
+
+function normalizePlanSteps(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const candidates = Array.isArray(payload.steps)
+    ? payload.steps
+    : Array.isArray(payload.plan)
+      ? payload.plan
+      : [];
+
+  return candidates
+    .map(step => typeof step === "string" ? step.trim() : "")
+    .filter(Boolean);
+}
+
+function normalizeValidationFlags(payload) {
+  const items = Array.isArray(payload)
+    ? payload
+    : payload && Array.isArray(payload.validation_flags)
+      ? payload.validation_flags
+      : [];
+
+  return items
+    .map(item => {
+      if (typeof item === "string") {
+        return item.trim();
+      }
+      if (item && typeof item === "object" && typeof item.message === "string") {
+        return item.message.trim();
+      }
+      return "";
+    })
+    .filter(Boolean);
+}
+
+function renderPlanBlock(output, steps, styled) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return;
+  }
+
+  const width = getWrapWidth(output);
+  const heading = stylize("Prophet is planning...", ANSI_GRAY, styled, { dim: true });
+  const renderedSteps = steps
+    .map((step, index) => wrapText(step, width, {
+      firstIndent: `  ${index + 1}. `,
+      restIndent: "     ",
+    }))
+    .map(text => stylize(text, ANSI_GRAY, styled, { dim: true }))
+    .join("\n");
+
+  writeLine(output, `\n${heading}\n\n${renderedSteps}\n\n`);
+}
+
+function renderValidationFlags(consoleLike, flags, options = {}) {
+  if (!Array.isArray(flags) || flags.length === 0) {
+    return;
+  }
+
+  const styled = Boolean(options.styled);
+  const width = getWrapWidth(options.output);
+  const prefixPlain = "⚠  ";
+  const prefix = stylize(prefixPlain, ANSI_YELLOW, styled, { bold: true });
+  const continuation = "   ";
+  const rendered = flags
+    .map(flag => wrapText(flag, width, {
+      firstIndent: prefixPlain,
+      restIndent: continuation,
+    })
+      .split("\n")
+      .map((line, index) => {
+        if (!styled) {
+          return line;
+        }
+        if (index === 0 && line.startsWith(prefixPlain)) {
+          return `${prefix}${stylize(line.slice(prefixPlain.length), ANSI_YELLOW, styled)}`;
+        }
+        return stylize(line, ANSI_YELLOW, styled);
+      })
+      .join("\n"))
+    .join("\n");
+
+  consoleLike.log(`\n${rendered}`);
 }
 
 function renderHelpMenu(consoleLike, commands, options = {}) {
@@ -1161,6 +1269,11 @@ function renderChatResponse(consoleLike, data, options = {}) {
     renderModelPicker(consoleLike, data.metadata, { styled, output: options.output });
     consoleLike.log("");
   }
+
+  renderValidationFlags(consoleLike, normalizeValidationFlags(data), {
+    styled,
+    output: options.output,
+  });
 }
 
 function renderStreamedPrefix(output, styled) {
@@ -1635,11 +1748,15 @@ module.exports = {
   formatUpdateNotification,
   formatWelcomeBackMessage,
   loadingLabelsFor,
+  normalizePlanSteps,
+  normalizeValidationFlags,
   parseCommand,
   requestJson,
   requestJsonWithSpinner,
   renderChatResponse,
+  renderPlanBlock,
   renderReasoningLine,
+  renderValidationFlags,
   runCli,
   shuffleLabels,
   startUpdateCheck,

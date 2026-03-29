@@ -17,9 +17,13 @@ const {
   formatSpinnerText,
   formatUpdateNotification,
   loadingLabelsFor,
+  normalizePlanSteps,
+  normalizeValidationFlags,
   parseCommand,
   renderChatResponse,
+  renderPlanBlock,
   renderReasoningLine,
+  renderValidationFlags,
   runCli,
   shuffleLabels,
   startUpdateCheck,
@@ -522,6 +526,60 @@ test("runCli streams chat chunks when the backend returns SSE", async () => {
   assert.doesNotMatch(stripAnsi(fakeConsole.messages[2]), /\*\*/);
 });
 
+test("runCli renders a plan block before the first reasoning line", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream({ isTTY: true });
+  const fetch = async () => createSseResponse([
+    {
+      event: "plan",
+      data: {
+        steps: [
+          "Fetch H1 bias for EURUSD and XAUUSD",
+          "Scan M15 setups for both pairs",
+          "Check economic calendar for USD events today",
+        ],
+      },
+    },
+    { event: "reasoning", data: { message: "Fetching H1 bias for EURUSD..." } },
+    { event: "message", data: { delta: "Bias is aligned." } },
+    { event: "done", data: { message: "Bias is aligned.", session_id: "abc123", metadata: {} } },
+  ]);
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  const rendered = stripAnsi(stream.writes.join(""));
+  const planIndex = rendered.indexOf("Prophet is planning...");
+  const reasoningIndex = rendered.indexOf("◆ Fetching H1 bias for EURUSD...");
+  assert.ok(planIndex >= 0);
+  assert.ok(reasoningIndex > planIndex);
+});
+
+test("runCli ignores plan events that arrive after answer text starts", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream({ isTTY: true });
+  const fetch = async () => createSseResponse([
+    { event: "message", data: { delta: "Main answer already started. " } },
+    { event: "plan", data: { steps: ["This should not render."] } },
+    { event: "done", data: { message: "Main answer already started.", session_id: "abc123", metadata: {} } },
+  ]);
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.doesNotMatch(stripAnsi(stream.writes.join("")), /Prophet is planning/);
+});
+
 test("runCli strips stray bold markers from streamed chunks", async () => {
   const stream = createStream({ isTTY: true });
   const fakeConsole = createConsole();
@@ -566,6 +624,58 @@ test("runCli renders the final streamed response without collapsing spaces", asy
   assert.match(fakeConsole.messages[2], /No\. The market is currently closed\. Asia opens soon\./);
 });
 
+test("runCli renders validation flags from the done payload after the main answer", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream({ isTTY: true });
+  const fetch = async () => createSseResponse([
+    { event: "message", data: { delta: "Main analysis text." } },
+    {
+      event: "done",
+      data: {
+        message: "Main analysis text.",
+        session_id: "abc123",
+        metadata: {},
+        validation_flags: [
+          "Rule check: You do not trade during Asia session.",
+          { message: "Asia session is currently active. Wait for London open." },
+        ],
+      },
+    },
+  ]);
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.match(fakeConsole.messages[2], /Main analysis text\./);
+  assert.match(stripAnsi(fakeConsole.messages[3]), /⚠  Rule check: You do not trade during Asia session\./);
+  assert.match(stripAnsi(fakeConsole.messages[3]), /Asia session is currently active\. Wait for London open\./);
+});
+
+test("runCli falls back to validation events when done payload has none", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream({ isTTY: true });
+  const fetch = async () => createSseResponse([
+    { event: "validation", data: { validation_flags: ["Rule check: Wait for London open."] } },
+    { event: "message", data: { delta: "Main analysis text." } },
+    { event: "done", data: { message: "Main analysis text.", session_id: "abc123", metadata: {} } },
+  ]);
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.match(stripAnsi(fakeConsole.messages[3]), /⚠  Rule check: Wait for London open\./);
+});
+
 test("runCli prints help for --help", async () => {
   const fakeConsole = createConsole();
 
@@ -607,6 +717,69 @@ test("renderReasoningLine preserves dim gray styling after the bullet", () => {
 
   const rendered = stream.writes.join("");
   assert.match(rendered, /\u001b\[1m\u001b\[90m◆\u001b\[0m \u001b\[2m\u001b\[90mGold is leading the watchlist right now\.\u001b\[0m/);
+});
+
+test("normalizePlanSteps supports steps and plan arrays", () => {
+  assert.deepEqual(
+    normalizePlanSteps({ steps: [" Fetch H1 bias ", "", "Scan M15 setups"] }),
+    ["Fetch H1 bias", "Scan M15 setups"],
+  );
+  assert.deepEqual(
+    normalizePlanSteps({ plan: ["Check calendar"] }),
+    ["Check calendar"],
+  );
+});
+
+test("normalizeValidationFlags supports strings and message objects", () => {
+  assert.deepEqual(
+    normalizeValidationFlags({
+      validation_flags: [" Rule check: Wait for London open. ", { message: "Asia session is active." }],
+    }),
+    ["Rule check: Wait for London open.", "Asia session is active."],
+  );
+});
+
+test("renderPlanBlock prints a muted numbered plan with spacing", () => {
+  const stream = createStream({ isTTY: true, columns: 80 });
+
+  renderPlanBlock(stream, [
+    "Fetch H1 bias for EURUSD and XAUUSD",
+    "Scan M15 setups for both pairs",
+  ], true);
+
+  const rendered = stripAnsi(stream.writes.join(""));
+  assert.match(rendered, /\nProphet is planning\.\.\.\n\n  1\. Fetch H1 bias for EURUSD and XAUUSD\n  2\. Scan M15 setups for both pairs\n\n$/);
+});
+
+test("renderPlanBlock wraps long steps under the numbered indent", () => {
+  const stream = createStream({ columns: 34 });
+
+  renderPlanBlock(stream, [
+    "Check economic calendar for USD events today before London open.",
+  ], false);
+
+  const lines = stripAnsi(stream.writes.join("")).trimEnd().split("\n").filter(Boolean);
+  assert.equal(lines[0], "Prophet is planning...");
+  assert.equal(lines[1], "  1. Check economic calendar for");
+  assert.equal(lines[2], "     USD events today before");
+  assert.equal(lines[3], "     London open.");
+});
+
+test("renderValidationFlags prints amber-style warning blocks with aligned wraps", () => {
+  const fakeConsole = createConsole();
+
+  renderValidationFlags(fakeConsole, [
+    "Rule check: You do not trade during Asia session. Asia session is currently active. Wait for London open.",
+  ], {
+    styled: false,
+    output: { columns: 44 },
+  });
+
+  const lines = fakeConsole.messages[0].split("\n");
+  assert.equal(lines[0], "");
+  assert.equal(lines[1], "⚠  Rule check: You do not trade during Asia");
+  assert.equal(lines[2], "   session. Asia session is currently");
+  assert.equal(lines[3], "   active. Wait for London open.");
 });
 
 test("runCli renders post-stream help metadata after a streamed reply", async () => {
