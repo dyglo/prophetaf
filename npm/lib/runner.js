@@ -10,6 +10,7 @@ const {
   validateImageFile,
 } = require("./image_handler");
 const { runOnboarding } = require("./onboarding");
+const { startWhatsAppGateway } = require("./whatsapp_gateway/runtime");
 let updateNotifierModulePromise;
 
 const PROPHET_BANNER = `
@@ -138,7 +139,7 @@ function normalizeCommand(token) {
     return "chat";
   }
 
-  if (["chat", "scan", "bias", "risk", "resume"].includes(token)) {
+  if (["chat", "scan", "bias", "risk", "resume", "whatsapp"].includes(token)) {
     return token;
   }
 
@@ -216,6 +217,12 @@ function parseCommand(argv) {
     };
   }
 
+  if (command === "whatsapp") {
+    return {
+      command,
+    };
+  }
+
   return {
     command: "chat",
     message: positionals.join(" ").trim(),
@@ -233,6 +240,7 @@ function formatHelpText() {
     "  risk --pair PAIR --sl N --risk PCT",
     "                            Calculate position size",
     "  resume                    Resume the latest saved session",
+    "  whatsapp                  Start the WhatsApp gateway",
     "",
     "Flags:",
     "  -h, --help                Show this help message",
@@ -1609,6 +1617,17 @@ async function runCli(overrides = {}) {
 
   if (parsed.command === "chat") {
     return runChat(consoleLike, fetchImpl, { ...overrides, config }, parsed.message);
+  }
+  if (parsed.command === "whatsapp") {
+    const runGateway = overrides.runWhatsAppGateway || startWhatsAppGateway;
+    return runGateway({
+      ...overrides,
+      console: consoleLike,
+      fetch: fetchImpl,
+      config,
+      stdin: overrides.stdin || process.stdin,
+      stdout: overrides.stdout || process.stdout,
+    });
   }
   if (parsed.command === "resume") {
     return runChat(consoleLike, fetchImpl, { ...overrides, config, resumeLatest: true }, null);
