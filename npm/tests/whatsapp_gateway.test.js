@@ -210,6 +210,50 @@ test("createInboundMessageHandler routes self chat messages, persists session id
   assert.equal(readWhatsAppState(config).session_id, "sess-2");
 });
 
+test("createInboundMessageHandler treats empty backend bodies as a non-throwing new session reply", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, {
+    device_token: "device-123",
+    display_name: "Tafar",
+    onboarded: true,
+  });
+  const fakeConsole = createConsole();
+  const tracker = new SentMessageTracker();
+  const replies = [];
+
+  const handler = createInboundMessageHandler({
+    config,
+    tracker,
+    gatewayStartedAt: Date.now() - 2000,
+    console: fakeConsole,
+    getOwnChatId: () => "me@c.us",
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      async text() {
+        return "";
+      },
+    }),
+  });
+
+  const result = await handler({
+    fromMe: true,
+    body: "hello",
+    timestamp: Math.floor(Date.now() / 1000),
+    id: { _serialized: "msg-empty" },
+    getChat: async () => ({ id: { _serialized: "me@c.us" } }),
+    async reply(text) {
+      replies.push(text);
+      return { id: { _serialized: "reply-empty" } };
+    },
+  });
+
+  assert.deepEqual(result, { response: null, sent: null });
+  assert.equal(readWhatsAppState(config).session_id, null);
+  assert.equal(replies.length, 0);
+  assert.ok(fakeConsole.messages.some(message => message.includes("session new")));
+});
+
 test("startWhatsAppGateway bootstraps onboarding before initializing the client", async () => {
   const fakeConsole = createConsole();
   const qrCalls = [];

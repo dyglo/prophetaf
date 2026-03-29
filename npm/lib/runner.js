@@ -1602,6 +1602,17 @@ async function runCli(overrides = {}) {
     consoleLike.log(formatHelpText());
     return 0;
   }
+  if (parsed.command === "whatsapp") {
+    const runGateway = overrides.runWhatsAppGateway || startWhatsAppGateway;
+    return runGateway({
+      ...overrides,
+      console: consoleLike,
+      fetch: fetchImpl,
+      config,
+      stdin: overrides.stdin || process.stdin,
+      stdout: overrides.stdout || process.stdout,
+    });
+  }
 
   const shouldBootstrapProfile = overrides.enableProfileBootstrap === true
     || (!overrides.fetch && config && typeof config.configExists === "function");
@@ -1617,17 +1628,6 @@ async function runCli(overrides = {}) {
 
   if (parsed.command === "chat") {
     return runChat(consoleLike, fetchImpl, { ...overrides, config }, parsed.message);
-  }
-  if (parsed.command === "whatsapp") {
-    const runGateway = overrides.runWhatsAppGateway || startWhatsAppGateway;
-    return runGateway({
-      ...overrides,
-      console: consoleLike,
-      fetch: fetchImpl,
-      config,
-      stdin: overrides.stdin || process.stdin,
-      stdout: overrides.stdout || process.stdout,
-    });
   }
   if (parsed.command === "resume") {
     return runChat(consoleLike, fetchImpl, { ...overrides, config, resumeLatest: true }, null);

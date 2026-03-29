@@ -77,7 +77,8 @@ function createInboundMessageHandler(options = {}) {
     const response = await sendChatMessage(fetchImpl, body, currentState.session_id || null, { config });
     updateWhatsAppState({ session_id: response && response.session_id ? response.session_id : null }, config);
     const sent = await sendReplyToWhatsApp(message, response, tracker);
-    consoleLike.log(`WhatsApp reply sent for session ${response.session_id || "new"}.`);
+    const sessionId = response && response.session_id ? response.session_id : "new";
+    consoleLike.log(`WhatsApp reply sent for session ${sessionId}.`);
     return { response, sent };
   };
 }
