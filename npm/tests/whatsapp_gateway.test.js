@@ -384,6 +384,9 @@ test("startWhatsAppGateway fails before initialization when Linux Chromium depen
       whatsappModule: {
         LocalAuth: class LocalAuth {},
       },
+      qrTerminal: {
+        generate() {},
+      },
       createClient: () => ({
         on() {},
         async initialize() {
