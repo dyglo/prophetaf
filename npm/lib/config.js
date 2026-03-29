@@ -5,6 +5,10 @@ const os = require("node:os");
 const path = require("node:path");
 
 function getConfigDir() {
+  const override = process.env.PROPHET_CONFIG_DIR;
+  if (typeof override === "string" && override.trim().length > 0) {
+    return override.trim();
+  }
   return path.join(os.homedir(), ".prophet");
 }
 

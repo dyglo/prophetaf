@@ -56,12 +56,16 @@ function createInboundMessageHandler(options = {}) {
   const consoleLike = options.console || global.console;
   const config = options.config;
   const tracker = options.tracker;
+  const onHandled = typeof options.onHandled === "function" ? options.onHandled : null;
   const gatewayStartedAt = Number(options.gatewayStartedAt || Date.now());
   const getOwnChatId = typeof options.getOwnChatId === "function"
     ? options.getOwnChatId
     : () => options.ownChatId || "";
 
   return async message => {
+    if (!message || typeof message !== "object") {
+      return null;
+    }
     const ownChatId = await Promise.resolve(getOwnChatId());
     const allowed = await shouldProcessMessage(message, {
       ownChatId,
@@ -72,11 +76,20 @@ function createInboundMessageHandler(options = {}) {
       return null;
     }
 
-    const body = message.body.trim();
+    const body = typeof message.body === "string" ? message.body.trim() : "";
+    if (!body) {
+      return null;
+    }
     const currentState = readWhatsAppState(config);
     const response = await sendChatMessage(fetchImpl, body, currentState.session_id || null, { config });
     updateWhatsAppState({ session_id: response && response.session_id ? response.session_id : null }, config);
     const sent = await sendReplyToWhatsApp(message, response, tracker);
+    if (sent && onHandled) {
+      await Promise.resolve(onHandled({
+        messageId: messageIdentifier(message),
+        sessionId: response && response.session_id ? response.session_id : null,
+      }));
+    }
     const sessionId = response && response.session_id ? response.session_id : "new";
     consoleLike.log(`WhatsApp reply sent for session ${sessionId}.`);
     return { response, sent };
