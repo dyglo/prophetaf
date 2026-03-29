@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 
 from langchain.agents import create_agent
@@ -26,6 +26,8 @@ except Exception:  # noqa: BLE001
 
 class AgentEventSink(Protocol):
     def update_status(self, message: str) -> None: ...
+
+    def emit_plan(self, message: str) -> None: ...
 
     def emit_reasoning(self, message: str) -> None: ...
 
@@ -72,9 +74,15 @@ class AgentRuntime:
         event_sink: AgentEventSink | None = None,
         history_messages: list[dict[str, Any]] | None = None,
         stream_handler: Callable[[str], None] | None = None,
+        prophet_md: str = "",
+        plan_handler: Callable[[str, list[dict[str, Any]]], str | None] | None = None,
         reasoning_handler: Callable[[str, str, dict[str, Any]], str] | None = None,
     ) -> AgentRunResult:
         failures: list[str] = []
+        plan = self._build_plan(user_message, history_messages or [], plan_handler)
+        scratchpad.ensure_init(user_message, plan)
+        if plan and event_sink:
+            event_sink.emit_plan(plan)
         try:
             candidates = AgentModelFactory(self.settings, self.env, self.model_override).candidates()
         except ProviderError as exc:
@@ -82,8 +90,8 @@ class AgentRuntime:
             candidates = []
 
         for candidate in candidates:
-            scratchpad.log(
-                "thinking",
+            scratchpad.log_thinking(
+                f"Starting provider {candidate.provider} with model {candidate.model_name}.",
                 {
                     "event": "provider_start",
                     "provider": candidate.provider,
@@ -101,18 +109,18 @@ class AgentRuntime:
                     event_sink=event_sink,
                     history_messages=history_messages,
                     stream_handler=stream_handler,
+                    prophet_md=prophet_md,
                     reasoning_handler=reasoning_handler,
                 )
             except GraphRecursionError:
                 self.logger.warning("Agent recursion limit reached for session")
                 partial = self._partial_message(artifacts, "I hit the configured reasoning-step limit, so this is a partial result.")
-                scratchpad.log(
-                    "final_response",
+                scratchpad.log_thinking(
+                    "The agent hit the configured reasoning-step limit and returned a partial result.",
                     {
                         "provider": candidate.provider,
                         "model": candidate.model_name,
                         "partial": True,
-                        "message": partial,
                     },
                 )
                 return AgentRunResult(
@@ -122,8 +130,8 @@ class AgentRuntime:
                 )
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{candidate.provider}: {exc}")
-                scratchpad.log(
-                    "thinking",
+                scratchpad.log_thinking(
+                    f"Provider {candidate.provider} failed and the runtime is falling back.",
                     {
                         "event": "provider_failure",
                         "provider": candidate.provider,
@@ -134,7 +142,10 @@ class AgentRuntime:
                 self.logger.warning("Agent provider %s failed: %s", candidate.provider, exc)
 
         fallback = self._partial_message(artifacts, "The agent fell back after provider failures.")
-        scratchpad.log("final_response", {"partial": True, "message": fallback, "failures": failures})
+        scratchpad.log_thinking(
+            "All configured providers failed, so the runtime returned the best partial result available.",
+            {"partial": True, "failures": failures},
+        )
         return AgentRunResult(
             message=fallback,
             artifacts=artifacts,
@@ -152,6 +163,7 @@ class AgentRuntime:
         event_sink: AgentEventSink | None,
         history_messages: list[dict[str, Any]] | None,
         stream_handler: Callable[[str], None] | None,
+        prophet_md: str,
         reasoning_handler: Callable[[str, str, dict[str, Any]], str] | None,
     ) -> AgentRunResult:
         agent = create_agent(
@@ -214,15 +226,7 @@ class AgentRuntime:
                 final_message = "".join(streamed_parts).strip()
         if not final_message:
             final_message = self._partial_message(artifacts, "I could not complete a final answer, so here is the latest partial result.")
-
-        scratchpad.log(
-            "final_response",
-            {
-                "provider": candidate.provider,
-                "model": candidate.model_name,
-                "message": final_message,
-            },
-        )
+        final_message = self._apply_validation_flags(final_message, prophet_md, artifacts, scratchpad)
         return AgentRunResult(
             message=final_message,
             artifacts=artifacts,
@@ -250,8 +254,8 @@ class AgentRuntime:
                 call_id = str(tool_call.get("id", ""))
                 if call_id:
                     pending_tool_calls[call_id] = {"name": name, "arguments": arguments}
-                scratchpad.log(
-                    "thinking",
+                scratchpad.log_thinking(
+                    f"Selected tool {name} for the next check.",
                     {
                         "event": "tool_selected",
                         "provider": provider,
@@ -276,8 +280,8 @@ class AgentRuntime:
         if isinstance(message, ToolMessage):
             tool_info = pending_tool_calls.pop(message.tool_call_id, {"name": "unknown", "arguments": {}})
             payload = self._parse_tool_message(message)
-            scratchpad.log(
-                "thinking",
+            scratchpad.log_thinking(
+                f"Received a result from {tool_info['name']}.",
                 {
                     "event": "tool_message",
                     "provider": provider,
@@ -303,8 +307,8 @@ class AgentRuntime:
         if isinstance(message, AIMessage):
             text = self._coerce_text(message)
             if text:
-                scratchpad.log(
-                    "thinking",
+                scratchpad.log_thinking(
+                    "The model is assembling the final trader-facing response.",
                     {
                         "event": "finalizing",
                         "provider": provider,
@@ -491,3 +495,116 @@ class AgentRuntime:
         stream_handler("\n\n")
         stream_handler(trade_plan.formatted_block)
         render_state["trade_plan_emitted"] = True
+
+    def _build_plan(
+        self,
+        user_message: str,
+        history_messages: list[dict[str, Any]],
+        plan_handler: Callable[[str, list[dict[str, Any]]], str | None] | None,
+    ) -> str | None:
+        if plan_handler is None:
+            return None
+        try:
+            plan = plan_handler(user_message, history_messages)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Planning handler failed: %s", exc)
+            return None
+        return plan.strip() if isinstance(plan, str) and plan.strip() else None
+
+    def _apply_validation_flags(
+        self,
+        message: str,
+        prophet_md: str,
+        artifacts: AgentArtifacts,
+        scratchpad: ScratchpadLogger,
+    ) -> str:
+        if not prophet_md.strip():
+            return message
+        flags = self._validation_flags(artifacts)
+        if not flags:
+            return message
+        scratchpad.log_thinking(
+            "The runtime appended validation flags from PROPHET guardrails to the final response.",
+            {"flags": flags},
+        )
+        return f"{message.rstrip()}\n\nValidation Flags:\n" + "\n".join(f"- {flag}" for flag in flags)
+
+    def _validation_flags(self, artifacts: AgentArtifacts) -> list[str]:
+        flags: list[str] = []
+        current_session = self._current_session_name()
+        trade_plan_session = (artifacts.trade_plan.session if artifacts.trade_plan else "").strip()
+        if current_session == "Asia" or trade_plan_session.lower() == "asia":
+            flags.append("Asia session trading is active, which violates the no-Asia-session guardrail.")
+
+        news_flag = self._news_validation_flag(artifacts)
+        if news_flag:
+            flags.append(news_flag)
+
+        if self._has_ranging_bias(artifacts):
+            flags.append("Market structure is ranging with no clear directional bias, so stand-aside conditions apply.")
+
+        setup_count = max(len(artifacts.setups), len(artifacts.metadata.get("ranking") or []))
+        if setup_count > 3:
+            flags.append(f"More than 3 setups were surfaced in one session ({setup_count}), so focus needs tightening.")
+
+        return flags
+
+    def _current_session_name(self) -> str:
+        from hedge_fund.chat.utils import current_session_status
+
+        return str(current_session_status(self.settings.trading.sessions).get("current_session") or "").strip()
+
+    def _news_validation_flag(self, artifacts: AgentArtifacts) -> str | None:
+        calendar = artifacts.metadata.get("calendar")
+        if not isinstance(calendar, dict):
+            return None
+        pair = self._validation_pair(artifacts)
+        if not pair:
+            return None
+        now = datetime.now(tz=UTC)
+        for event in calendar.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("impact", "")).lower() != "high":
+                continue
+            if not self._event_affects_pair(str(event.get("currency", "")), pair):
+                continue
+            scheduled = self._parse_event_time(str(event.get("date", "")), str(event.get("time_utc", "")))
+            if scheduled is None:
+                continue
+            if abs(now - scheduled) <= timedelta(minutes=15):
+                event_name = str(event.get("event_name") or "high-impact event").strip()
+                return f"High-impact news ({event_name}) is within 15 minutes for {pair}, so entries should be avoided."
+        return None
+
+    def _validation_pair(self, artifacts: AgentArtifacts) -> str | None:
+        if artifacts.trade_plan is not None:
+            return artifacts.trade_plan.pair
+        if artifacts.biases:
+            return artifacts.biases[0].pair
+        if artifacts.setups:
+            return artifacts.setups[0].pair
+        ranking = artifacts.metadata.get("ranking") or []
+        if ranking and isinstance(ranking[0], dict):
+            return str(ranking[0].get("pair") or "").strip() or None
+        return None
+
+    def _parse_event_time(self, date_value: str, time_value: str) -> datetime | None:
+        if not date_value or not time_value:
+            return None
+        try:
+            return datetime.strptime(f"{date_value} {time_value}", "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+        except ValueError:
+            return None
+
+    def _event_affects_pair(self, currency: str, pair: str) -> bool:
+        if pair == "XAUUSD":
+            return currency == "USD"
+        return currency in pair
+
+    def _has_ranging_bias(self, artifacts: AgentArtifacts) -> bool:
+        if any(item.bias == "Ranging" for item in artifacts.biases):
+            return True
+        if artifacts.setups and all(item.direction == "Neutral" for item in artifacts.setups):
+            return True
+        return False

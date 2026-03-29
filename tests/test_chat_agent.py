@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -158,6 +159,10 @@ def _state(tmp_path):
     return store, state
 
 
+def _scratchpad_entries(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def test_agent_tool_returns_bias_payload_and_logs_scratchpad(tmp_path) -> None:
     store, state = _state(tmp_path)
     scratchpad = ScratchpadManager(tmp_path, Settings.load().agent).for_session(state.session.session_id)
@@ -181,9 +186,12 @@ def test_agent_tool_returns_bias_payload_and_logs_scratchpad(tmp_path) -> None:
 
     assert payload["ok"] is True
     assert payload["biases"][0]["pair"] == "XAUUSD"
-    entries = scratchpad.path.read_text(encoding="utf-8").splitlines()
-    assert any('"type": "tool_call"' in line for line in entries)
-    assert any('"type": "tool_result"' in line for line in entries)
+    entries = _scratchpad_entries(scratchpad.path)
+    assert entries[-1]["type"] == "tool_result"
+    assert entries[-1]["toolName"] == "get_market_bias"
+    assert entries[-1]["args"] == {"pair": "Gold", "all_pairs": False}
+    assert entries[-1]["rawResult"]["ok"] is True
+    assert "XAUUSD: Bullish" in entries[-1]["llmSummary"]
     assert state.session.context.active_pair == "XAUUSD"
 
 
@@ -430,6 +438,191 @@ def test_agent_emits_reasoning_before_and_after_tool_calls(tmp_path, monkeypatch
     assert ("step", "Reading market structure...") in events
     assert ("reasoning", "before:get_market_bias:XAUUSD") in events
     assert ("reasoning", "after:get_market_bias:XAUUSD bias is bullish.") in events
+
+
+def test_agent_emits_plan_before_tool_calls_for_multi_tool_runs(tmp_path, monkeypatch) -> None:
+    runtime = AgentRuntime(Settings.load(), EnvironmentSettings(database_url="sqlite://", openai_api_key="key"), logging.getLogger("test"))
+    scratchpad = ScratchpadManager(tmp_path, Settings.load().agent).for_session("session123")
+    artifacts = AgentArtifacts()
+    events = []
+
+    class Sink:
+        def update_status(self, message: str) -> None:
+            events.append(("step", message))
+
+        def emit_plan(self, message: str) -> None:
+            events.append(("plan", message))
+
+        def emit_reasoning(self, message: str) -> None:
+            events.append(("reasoning", message))
+
+    class ToolAgent:
+        def stream(self, payload, config=None, stream_mode=None):
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {"name": "get_market_bias", "args": {"pair": "XAUUSD"}, "id": "call-1", "type": "tool_call"},
+                                    {"name": "get_economic_calendar", "args": {"view": "today"}, "id": "call-2", "type": "tool_call"},
+                                ],
+                            )
+                        ]
+                    }
+                },
+            )
+            yield ("updates", {"model": {"messages": [AIMessage(content="Final answer.")]}})
+
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.AgentModelFactory.candidates", lambda self: [type("C", (), {"provider": "openai", "model_name": "gpt-5-mini", "model": object()})()])
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.create_agent", lambda model, tools, system_prompt: ToolAgent())
+
+    runtime.run(
+        "Compare bias and news risk on Gold",
+        "system",
+        [],
+        scratchpad,
+        artifacts,
+        event_sink=Sink(),
+        plan_handler=lambda user_message, history_messages: "1. Check market bias.\n2. Check near-term news risk.",
+    )
+
+    assert events[0] == ("plan", "1. Check market bias.\n2. Check near-term news risk.")
+    assert any(event == ("step", "Reading market structure...") for event in events)
+    entries = _scratchpad_entries(scratchpad.path)
+    assert entries[0]["type"] == "init"
+    assert entries[0]["plan"] == "1. Check market bias.\n2. Check near-term news risk."
+
+
+def test_agent_skips_plan_event_for_single_tool_queries(tmp_path, monkeypatch) -> None:
+    runtime = AgentRuntime(Settings.load(), EnvironmentSettings(database_url="sqlite://", openai_api_key="key"), logging.getLogger("test"))
+    scratchpad = ScratchpadManager(tmp_path, Settings.load().agent).for_session("session123")
+    artifacts = AgentArtifacts()
+    events = []
+
+    class Sink:
+        def update_status(self, message: str) -> None:
+            events.append(("step", message))
+
+        def emit_plan(self, message: str) -> None:
+            events.append(("plan", message))
+
+        def emit_reasoning(self, message: str) -> None:
+            events.append(("reasoning", message))
+
+    class SingleToolAgent:
+        def stream(self, payload, config=None, stream_mode=None):
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[{"name": "get_market_bias", "args": {"pair": "XAUUSD"}, "id": "call-1", "type": "tool_call"}],
+                            )
+                        ]
+                    }
+                },
+            )
+            yield ("updates", {"model": {"messages": [AIMessage(content="Final answer.")]}})
+
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.AgentModelFactory.candidates", lambda self: [type("C", (), {"provider": "openai", "model_name": "gpt-5-mini", "model": object()})()])
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.create_agent", lambda model, tools, system_prompt: SingleToolAgent())
+
+    runtime.run(
+        "What is the bias on Gold?",
+        "system",
+        [],
+        scratchpad,
+        artifacts,
+        event_sink=Sink(),
+        plan_handler=lambda user_message, history_messages: None,
+    )
+
+    assert not any(kind == "plan" for kind, _ in events)
+    entries = _scratchpad_entries(scratchpad.path)
+    assert entries[0]["type"] == "init"
+    assert entries[0]["plan"] is None
+
+
+def test_agent_appends_validation_flags_when_prophet_rules_are_present(tmp_path, monkeypatch) -> None:
+    runtime = AgentRuntime(Settings.load(), EnvironmentSettings(database_url="sqlite://", openai_api_key="key"), logging.getLogger("test"))
+    scratchpad = ScratchpadManager(tmp_path, Settings.load().agent).for_session("session123")
+    now = datetime.now(tz=UTC)
+    artifacts = AgentArtifacts(
+        biases=[BiasResult(pair="XAUUSD", bias="Ranging", structure="flat", key_level=2900.0, key_level_type="swing_low")],
+        setups=[
+            SetupScanResult(pair="XAUUSD", score=5, direction="Neutral", fvg_detected=False, fib_zone_hit=False, liquidity_sweep=False, signals_summary="A", surfaced=True),
+            SetupScanResult(pair="EURUSD", score=5, direction="Neutral", fvg_detected=False, fib_zone_hit=False, liquidity_sweep=False, signals_summary="B", surfaced=True),
+            SetupScanResult(pair="GBPUSD", score=5, direction="Neutral", fvg_detected=False, fib_zone_hit=False, liquidity_sweep=False, signals_summary="C", surfaced=True),
+            SetupScanResult(pair="USDJPY", score=5, direction="Neutral", fvg_detected=False, fib_zone_hit=False, liquidity_sweep=False, signals_summary="D", surfaced=True),
+        ],
+        metadata={
+            "calendar": {
+                "events": [
+                    {
+                        "date": now.strftime("%Y-%m-%d"),
+                        "time_utc": now.strftime("%H:%M"),
+                        "currency": "USD",
+                        "event_name": "US CPI",
+                        "impact": "High",
+                    }
+                ]
+            }
+        },
+    )
+
+    class FinalAgent:
+        def stream(self, payload, config=None, stream_mode=None):
+            yield ("updates", {"model": {"messages": [AIMessage(content="Final answer.")]}})
+
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.AgentModelFactory.candidates", lambda self: [type("C", (), {"provider": "openai", "model_name": "gpt-5-mini", "model": object()})()])
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.create_agent", lambda model, tools, system_prompt: FinalAgent())
+    monkeypatch.setattr("hedge_fund.chat.utils.current_session_status", lambda sessions, now=None: {"current_session": "Asia", "status": "Asia is open now."})
+
+    result = runtime.run(
+        "Need a read on Gold",
+        "system",
+        [],
+        scratchpad,
+        artifacts,
+        prophet_md="# Rules\n- anything",
+    )
+
+    assert "Validation Flags:" in result.message
+    assert "Asia session trading is active" in result.message
+    assert "High-impact news (US CPI) is within 15 minutes" in result.message
+    assert "ranging with no clear directional bias" in result.message
+    assert "More than 3 setups were surfaced" in result.message
+
+
+def test_agent_skips_validation_when_prophet_rules_are_empty(tmp_path, monkeypatch) -> None:
+    runtime = AgentRuntime(Settings.load(), EnvironmentSettings(database_url="sqlite://", openai_api_key="key"), logging.getLogger("test"))
+    scratchpad = ScratchpadManager(tmp_path, Settings.load().agent).for_session("session123")
+    artifacts = AgentArtifacts(
+        biases=[BiasResult(pair="XAUUSD", bias="Ranging", structure="flat", key_level=2900.0, key_level_type="swing_low")]
+    )
+
+    class FinalAgent:
+        def stream(self, payload, config=None, stream_mode=None):
+            yield ("updates", {"model": {"messages": [AIMessage(content="Final answer.")]}})
+
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.AgentModelFactory.candidates", lambda self: [type("C", (), {"provider": "openai", "model_name": "gpt-5-mini", "model": object()})()])
+    monkeypatch.setattr("hedge_fund.chat.agent_runtime.create_agent", lambda model, tools, system_prompt: FinalAgent())
+
+    result = runtime.run(
+        "Need a read on Gold",
+        "system",
+        [],
+        scratchpad,
+        artifacts,
+        prophet_md="",
+    )
+
+    assert result.message == "Final answer."
 
 
 def test_agent_runtime_streams_trade_plan_narrative_then_block(tmp_path, monkeypatch) -> None:

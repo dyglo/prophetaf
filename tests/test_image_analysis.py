@@ -112,7 +112,21 @@ class CapturingAgentRuntime:
         self.history_messages = None
         self.system_prompt = None
 
-    def run(self, *, user_message, system_prompt, tools, scratchpad, artifacts, event_sink=None, history_messages=None, stream_handler=None, reasoning_handler=None):
+    def run(
+        self,
+        *,
+        user_message,
+        system_prompt,
+        tools,
+        scratchpad,
+        artifacts,
+        event_sink=None,
+        history_messages=None,
+        stream_handler=None,
+        prophet_md="",
+        plan_handler=None,
+        reasoning_handler=None,
+    ):
         self.history_messages = history_messages
         self.system_prompt = system_prompt
         return SimpleNamespace(message="ok", metadata={})

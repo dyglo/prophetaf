@@ -240,6 +240,7 @@ class ChatService:
     ) -> ChatResponse:
         scratchpad = self.scratchpad_manager.for_session(state.session.session_id)
         artifacts = AgentArtifacts()
+        prophet_md = self._current_memory_content().strip()
         tool_context = AgentToolContext(
             settings=self.settings,
             state=state,
@@ -253,9 +254,20 @@ class ChatService:
             scratchpad=scratchpad,
             artifacts=artifacts,
             authorize_mutation=authorize_mutation,
+            tool_summary_handler=(
+                None
+                if not hasattr(self.language, "summarize_tool_result")
+                else lambda tool_name, arguments, raw_result: self.language.summarize_tool_result(
+                    tool_name,
+                    arguments,
+                    raw_result,
+                    user_message=content,
+                )
+            ),
         )
         self.agent_runtime.model_override = normalize_model_override(state.session.model_override)
         summarize_tool_reasoning = getattr(self.language, "summarize_tool_reasoning", None)
+        plan_agent_run = getattr(self.language, "plan_agent_run", None)
         result = self.agent_runtime.run(
             user_message=content,
             system_prompt=self._agent_system_prompt(state),
@@ -265,6 +277,12 @@ class ChatService:
             event_sink=event_sink,
             history_messages=self._agent_messages(state, content, image_attachments=image_attachments),
             stream_handler=stream_handler,
+            prophet_md=prophet_md,
+            plan_handler=(
+                None
+                if not callable(plan_agent_run)
+                else lambda user_message, history_messages: plan_agent_run(user_message, history_messages)
+            ),
             reasoning_handler=(
                 None
                 if not callable(summarize_tool_reasoning)
