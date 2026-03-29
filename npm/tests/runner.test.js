@@ -560,6 +560,36 @@ test("runCli renders a plan block before the first reasoning line", async () => 
   assert.ok(reasoningIndex > planIndex);
 });
 
+test("runCli renders a plan block before streamed answer text when message chunks arrive first", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream({ isTTY: true });
+  const fetch = async () => createSseResponse([
+    {
+      event: "plan",
+      data: {
+        steps: [
+          "Check EURUSD structure",
+          "Check XAUUSD structure",
+        ],
+      },
+    },
+    { event: "message", data: { delta: "Best setup is XAUUSD." } },
+    { event: "done", data: { message: "Best setup is XAUUSD.", session_id: "abc123", metadata: {} } },
+  ]);
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  const rendered = stripAnsi(stream.writes.join(""));
+  const planIndex = rendered.indexOf("Prophet is planning...");
+  assert.ok(planIndex >= 0);
+});
+
 test("runCli ignores plan events that arrive after answer text starts", async () => {
   const fakeConsole = createConsole();
   const stream = createStream({ isTTY: true });
@@ -1784,7 +1814,7 @@ test("runCli clears backend-rejected config on profile 400 and reruns onboarding
   assert.equal(calls.at(-1).options.headers["X-Device-Token"], "fresh-device");
 });
 
-test("runCli warns and continues when profile lookup fails offline", async () => {
+test("runCli continues silently when profile lookup fails offline", async () => {
   const config = createConfigStub({ device_token: "device-123", display_name: "Tafar", onboarded: true });
   const fakeConsole = createConsole();
   let profileAttempted = false;
@@ -1807,7 +1837,7 @@ test("runCli warns and continues when profile lookup fails offline", async () =>
 
   assert.equal(exitCode, 0);
   assert.equal(profileAttempted, true);
-  assert.ok(fakeConsole.messages.some(message => /could not verify your saved profile/i.test(message)));
+  assert.ok(!fakeConsole.messages.some(message => /could not verify your saved profile/i.test(message)));
 });
 
 test("runCli skips runner profile bootstrap for whatsapp mode", async () => {
@@ -1836,4 +1866,61 @@ test("runCli skips runner profile bootstrap for whatsapp mode", async () => {
   assert.equal(exitCode, 0);
   assert.equal(profileChecks, 0);
   assert.equal(gatewayCalls, 1);
+});
+
+test("runCli retries chat requests once after a network error", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream();
+  let attempts = 0;
+  const fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new Error("fetch failed");
+    }
+    return createJsonResponse({ message: "Recovered response", session_id: "abc123", metadata: {} });
+  };
+
+  const exitCode = await runCliForTest({
+    argv: ["hello there"],
+    console: fakeConsole,
+    fetch,
+    stdout: stream,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(attempts, 2);
+  assert.match(fakeConsole.messages[2], /Recovered response/);
+});
+
+test("runCli times out chat requests after 60 seconds and retries once", async () => {
+  const fakeConsole = createConsole();
+  const stream = createStream();
+  let attempts = 0;
+  const fetch = async (url, options = {}) => {
+    attempts += 1;
+    return await new Promise((resolve, reject) => {
+      if (options.signal && typeof options.signal.addEventListener === "function") {
+        options.signal.addEventListener("abort", () => {
+          reject(options.signal.reason || new Error("aborted"));
+        }, { once: true });
+      }
+      void resolve;
+    });
+  };
+
+  await assert.rejects(
+    () => runCliForTest({
+      argv: ["hello there"],
+      console: fakeConsole,
+      fetch,
+      stdout: stream,
+      timeoutMs: 5,
+    }),
+    error => {
+      assert.match(String(error && error.message), /timed out/i);
+      return true;
+    },
+  );
+
+  assert.equal(attempts, 2);
 });

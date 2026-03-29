@@ -1,9 +1,9 @@
 "use strict";
 
 const configStore = require("../config");
-const { runOnboarding } = require("../onboarding");
 
 const BACKEND_BASE_URL = "https://prophet-wwxjsbvhoa-uc.a.run.app";
+const WHATSAPP_SETUP_REQUIRED_MESSAGE = "WhatsApp requires an existing Prophet profile. Run prophetaf once in the terminal to finish setup, then run prophetaf whatsapp again.";
 
 class GatewayError extends Error {
   constructor(message, exitCode = 1) {
@@ -58,29 +58,14 @@ function isConfigValid(configModule, candidate) {
 
 async function ensureGatewayProfile(fetchImpl, consoleLike, options = {}) {
   const config = options.config || configStore;
-  const onboarding = options.runOnboarding || runOnboarding;
-
-  const runOnboardingFlow = async () => onboarding({
-    console: consoleLike,
-    fetch: fetchImpl,
-    config,
-    prompts: options.prompts,
-    stdin: options.stdin,
-    stdout: options.stdout,
-    backendBaseUrl: BACKEND_BASE_URL,
-  });
 
   if (!config.configExists || !config.configExists()) {
-    return runOnboardingFlow();
+    throw new GatewayError(WHATSAPP_SETUP_REQUIRED_MESSAGE);
   }
 
   const existing = typeof config.readConfig === "function" ? config.readConfig() : null;
   if (!isConfigValid(config, existing)) {
-    consoleLike.log("Warning: Profile config appears incomplete. Starting setup.");
-    if (typeof config.clearConfig === "function") {
-      config.clearConfig();
-    }
-    return runOnboardingFlow();
+    throw new GatewayError(WHATSAPP_SETUP_REQUIRED_MESSAGE);
   }
 
   try {
@@ -95,12 +80,8 @@ async function ensureGatewayProfile(fetchImpl, consoleLike, options = {}) {
     return { status: "loaded", profile };
   } catch (error) {
     if (error instanceof GatewayError && (error.status === 404 || error.status === 400)) {
-      if (typeof config.clearConfig === "function") {
-        config.clearConfig();
-      }
-      return runOnboardingFlow();
+      throw new GatewayError(WHATSAPP_SETUP_REQUIRED_MESSAGE, error.exitCode);
     }
-    consoleLike.log("Warning: Prophet could not verify your saved profile. Continuing without profile sync.");
     return { status: "offline" };
   }
 }
@@ -122,6 +103,7 @@ async function sendChatMessage(fetchImpl, message, sessionId, options = {}) {
 module.exports = {
   BACKEND_BASE_URL,
   GatewayError,
+  WHATSAPP_SETUP_REQUIRED_MESSAGE,
   buildDeviceHeaders,
   ensureGatewayProfile,
   requestJson,
