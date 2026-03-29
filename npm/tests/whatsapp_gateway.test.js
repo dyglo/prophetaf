@@ -79,26 +79,16 @@ function withTempDir(t) {
   return tempDir;
 }
 
-function waitForChildExit(child) {
-  if (!child || child.exitCode !== null || child.killed) {
-    return Promise.resolve();
-  }
-  return new Promise(resolve => {
-    const done = () => {
-      child.removeListener("exit", done);
-      child.removeListener("close", done);
-      resolve();
-    };
-    child.once("exit", done);
-    child.once("close", done);
-  });
-}
-
 test("parseCommand recognizes whatsapp mode", () => {
   assert.deepEqual(parseCommand(["whatsapp"]), { command: "whatsapp", mode: "foreground" });
   assert.deepEqual(parseCommand(["whatsapp", "--daemon"]), { command: "whatsapp", mode: "daemon" });
   assert.deepEqual(parseCommand(["whatsapp", "--stop"]), { command: "whatsapp", mode: "stop" });
   assert.deepEqual(parseCommand(["whatsapp", "--status"]), { command: "whatsapp", mode: "status" });
+});
+
+test("parseCommand still rejects missing values for non-boolean flags", () => {
+  assert.throws(() => parseCommand(["risk", "--pair", "XAUUSD", "--sl", "--risk", "1"]), /Missing value for --sl/);
+  assert.throws(() => parseCommand(["scan", "--pair"]), /Missing value for --pair/);
 });
 
 test("runCli dispatches whatsapp mode to the gateway runtime", async () => {
@@ -715,32 +705,50 @@ test("printWhatsAppDaemonStatus reports uptime and handled messages", async t =>
 test("stopWhatsAppDaemon gracefully stops the daemon and clears pid/state files", async t => {
   const tempDir = withTempDir(t);
   const config = createConfigStub(tempDir, null);
-  const child = childProcess.spawn(process.execPath, ["-e", [
-    "process.on('SIGTERM', () => process.exit(0));",
-    "setInterval(() => {}, 1000);",
-  ].join(" ")], {
-    cwd: os.tmpdir(),
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  t.after(() => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Child already exited.
-    }
-  });
+  const daemonPid = process.pid;
+  const killSignals = [];
 
-  fs.writeFileSync(getWhatsAppDaemonPidPath(config), `${child.pid}\n`, "utf8");
+  fs.writeFileSync(getWhatsAppDaemonPidPath(config), `${daemonPid}\n`, "utf8");
   fs.writeFileSync(getWhatsAppDaemonStatePath(config), JSON.stringify({ started_at: Date.now(), message_count: 3 }), "utf8");
   const fakeConsole = createConsole();
 
   const exitCode = await stopWhatsAppDaemon({
     console: fakeConsole,
     config,
+    processKill(pid, signal) {
+      killSignals.push([pid, signal]);
+    },
     stopTimeoutMs: 5_000,
+    waitForProcessExit: async () => true,
   });
-  await waitForChildExit(child);
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(killSignals, [[daemonPid, "SIGTERM"]]);
+  assert.equal(fs.existsSync(getWhatsAppDaemonPidPath(config)), false);
+  assert.equal(fs.existsSync(getWhatsAppDaemonStatePath(config)), false);
+  assert.ok(fakeConsole.messages.some(message => message.includes("daemon stopped")));
+});
+
+test("stopWhatsAppDaemon treats ESRCH during shutdown as an already-stopped daemon", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, null);
+  const daemonPid = process.pid;
+  fs.writeFileSync(getWhatsAppDaemonPidPath(config), `${daemonPid}\n`, "utf8");
+  fs.writeFileSync(getWhatsAppDaemonStatePath(config), JSON.stringify({ started_at: Date.now(), message_count: 1 }), "utf8");
+  const fakeConsole = createConsole();
+
+  const exitCode = await stopWhatsAppDaemon({
+    console: fakeConsole,
+    config,
+    processKill() {
+      const error = new Error("no such process");
+      error.code = "ESRCH";
+      throw error;
+    },
+    waitForProcessExit: async () => {
+      throw new Error("waitForProcessExit should not run after ESRCH");
+    },
+  });
 
   assert.equal(exitCode, 0);
   assert.equal(fs.existsSync(getWhatsAppDaemonPidPath(config)), false);

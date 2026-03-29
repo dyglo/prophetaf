@@ -148,9 +148,10 @@ function normalizeCommand(token) {
   return "chat";
 }
 
-function parseFlags(args) {
+function parseFlags(args, options = {}) {
   const flags = {};
   const positionals = [];
+  const booleanFlags = new Set(options.booleanFlags || []);
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -162,8 +163,11 @@ function parseFlags(args) {
     const key = arg.slice(2);
     const next = args[index + 1];
     if (!next || next.startsWith("--")) {
-      flags[key] = true;
-      continue;
+      if (booleanFlags.has(key)) {
+        flags[key] = true;
+        continue;
+      }
+      throw new UserError(`Missing value for --${key}`);
     }
 
     flags[key] = next;
@@ -181,7 +185,9 @@ function parseCommand(argv) {
   const first = filtered[0];
   const command = normalizeCommand(first);
   const rest = command === "chat" && first !== "chat" ? filtered : filtered.slice(1);
-  const { flags, positionals } = parseFlags(rest);
+  const { flags, positionals } = parseFlags(rest, {
+    booleanFlags: command === "whatsapp" ? ["daemon", "stop", "status", "daemon-child"] : [],
+  });
 
   if (command === "scan" || command === "bias") {
     return {

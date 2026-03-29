@@ -292,6 +292,8 @@ async function startWhatsAppDaemon(options = {}) {
 async function stopWhatsAppDaemon(options = {}) {
   const consoleLike = options.console || global.console;
   const config = options.config;
+  const processKill = options.processKill || process.kill.bind(process);
+  const waitForExit = options.waitForProcessExit || waitForProcessExit;
   const pid = cleanupStaleDaemonState(config);
   if (!pid) {
     consoleLike.log("Prophet WhatsApp daemon is not running.");
@@ -299,11 +301,30 @@ async function stopWhatsAppDaemon(options = {}) {
     return 0;
   }
 
-  process.kill(pid, "SIGTERM");
-  let exited = await waitForProcessExit(pid, { timeoutMs: options.stopTimeoutMs });
+  let exited = false;
+  try {
+    processKill(pid, "SIGTERM");
+  } catch (error) {
+    if (!error || error.code !== "ESRCH") {
+      throw error;
+    }
+    exited = true;
+  }
   if (!exited) {
-    process.kill(pid, "SIGKILL");
-    exited = await waitForProcessExit(pid, { timeoutMs: 2_000 });
+    exited = await waitForExit(pid, { timeoutMs: options.stopTimeoutMs });
+  }
+  if (!exited) {
+    try {
+      processKill(pid, "SIGKILL");
+    } catch (error) {
+      if (!error || error.code !== "ESRCH") {
+        throw error;
+      }
+      exited = true;
+    }
+  }
+  if (!exited) {
+    exited = await waitForExit(pid, { timeoutMs: 2_000 });
   }
   clearWhatsAppDaemonFiles(config);
   if (!exited) {
