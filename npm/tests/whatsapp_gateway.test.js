@@ -79,6 +79,21 @@ function withTempDir(t) {
   return tempDir;
 }
 
+function waitForChildExit(child) {
+  if (!child || child.exitCode !== null || child.killed) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    const done = () => {
+      child.removeListener("exit", done);
+      child.removeListener("close", done);
+      resolve();
+    };
+    child.once("exit", done);
+    child.once("close", done);
+  });
+}
+
 test("parseCommand recognizes whatsapp mode", () => {
   assert.deepEqual(parseCommand(["whatsapp"]), { command: "whatsapp", mode: "foreground" });
   assert.deepEqual(parseCommand(["whatsapp", "--daemon"]), { command: "whatsapp", mode: "daemon" });
@@ -725,9 +740,7 @@ test("stopWhatsAppDaemon gracefully stops the daemon and clears pid/state files"
     config,
     stopTimeoutMs: 5_000,
   });
-  await new Promise(resolve => {
-    child.once("exit", resolve);
-  });
+  await waitForChildExit(child);
 
   assert.equal(exitCode, 0);
   assert.equal(fs.existsSync(getWhatsAppDaemonPidPath(config)), false);
