@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
@@ -237,6 +238,15 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
+def _plan_steps(plan: str) -> list[str]:
+    steps: list[str] = []
+    for raw_line in str(plan or "").splitlines():
+        line = re.sub(r"^\s*\d+[\.\)]\s*", "", raw_line).strip()
+        if line:
+            steps.append(line)
+    return steps
+
+
 class StreamingAgentEventSink(AgentEventSink):
     def __init__(self, queue: Queue[tuple[str, object]]) -> None:
         self.queue = queue
@@ -245,7 +255,7 @@ class StreamingAgentEventSink(AgentEventSink):
         self.queue.put(("step", {"message": message}))
 
     def emit_plan(self, message: str) -> None:
-        self.queue.put(("plan", {"message": message}))
+        self.queue.put(("plan", {"steps": _plan_steps(message)}))
 
     def emit_reasoning(self, message: str) -> None:
         self.queue.put(("reasoning", {"message": message}))

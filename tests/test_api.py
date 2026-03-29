@@ -246,7 +246,7 @@ def test_chat_endpoint_streams_sse_events(monkeypatch) -> None:
 
     combined = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
     assert "event: plan" in combined
-    assert '"message": "1. Check the watchlist.\\n2. Compare the strongest setups."' in combined
+    assert '"steps": ["Check the watchlist.", "Compare the strongest setups."]' in combined
     assert "event: step" in combined
     assert '"message": "Scanning the watchlist..."' in combined
     assert "event: reasoning" in combined
