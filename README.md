@@ -26,6 +26,7 @@ prophetaf
 - SSE streaming chat responses from backend to CLI
 - Interactive selectors for models, pairs, sessions, and calendar views
 - WhatsApp gateway via QR scan using `whatsapp-web.js`
+- Background WhatsApp daemon mode with `--daemon`, `--status`, and `--stop`
 
 ## Trading Methodology
 
@@ -103,6 +104,44 @@ npm run gateway
 After the phone is linked, send a message to your own WhatsApp number. Prophet will intercept messages from that self-chat, send them to the hosted `/chat` backend, and reply back in plain text.
 
 The gateway keeps a dedicated local WhatsApp chat session id in `~/.prophet/whatsapp-chat.json`, so follow-up messages preserve Prophet conversation context just like the CLI. Existing slash commands such as `/memory`, `/calendar`, `/pairs`, `/sessions`, and `/help` also work through WhatsApp.
+
+### Daemon Mode
+
+If you want Prophet to stay online after closing the terminal, run the WhatsApp gateway in daemon mode:
+
+```bash
+prophetaf whatsapp --daemon
+```
+
+This starts a detached background process and stores:
+
+- daemon PID in `~/.prophet/whatsapp-daemon.pid`
+- daemon state in `~/.prophet/whatsapp-daemon.json`
+- daemon logs in `~/.prophet/whatsapp-daemon.log`
+
+Check whether the daemon is running:
+
+```bash
+prophetaf whatsapp --status
+```
+
+Stop the daemon cleanly:
+
+```bash
+prophetaf whatsapp --stop
+```
+
+Foreground mode and daemon mode share the same local WhatsApp auth session under `~/.prophet/whatsapp-session/`, so you do not need to rescan the QR code when switching between them unless the WhatsApp session itself expires.
+
+### Linux Dependencies
+
+On Linux, `whatsapp-web.js` runs Chromium through Puppeteer. If required shared libraries are missing, install them before starting the gateway:
+
+```bash
+sudo apt-get install -y libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2
+```
+
+On Ubuntu 24.04 and newer, some package names may appear as `t64` variants such as `libatk1.0-0t64`, `libatk-bridge2.0-0t64`, `libcups2t64`, and `libasound2t64`.
 
 ## Contributing
 

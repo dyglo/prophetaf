@@ -46,6 +46,9 @@ async function sendReplyToWhatsApp(message, response, tracker) {
   if (!text) {
     return null;
   }
+  if (!message || typeof message.reply !== "function") {
+    throw new Error("WhatsApp message cannot be replied to because the event payload is missing reply().");
+  }
   const sent = await message.reply(text);
   if (tracker) {
     tracker.remember(messageIdentifier(sent));

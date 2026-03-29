@@ -148,9 +148,10 @@ function normalizeCommand(token) {
   return "chat";
 }
 
-function parseFlags(args) {
+function parseFlags(args, options = {}) {
   const flags = {};
   const positionals = [];
+  const booleanFlags = new Set(options.booleanFlags || []);
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -162,6 +163,10 @@ function parseFlags(args) {
     const key = arg.slice(2);
     const next = args[index + 1];
     if (!next || next.startsWith("--")) {
+      if (booleanFlags.has(key)) {
+        flags[key] = true;
+        continue;
+      }
       throw new UserError(`Missing value for --${key}`);
     }
 
@@ -180,7 +185,9 @@ function parseCommand(argv) {
   const first = filtered[0];
   const command = normalizeCommand(first);
   const rest = command === "chat" && first !== "chat" ? filtered : filtered.slice(1);
-  const { flags, positionals } = parseFlags(rest);
+  const { flags, positionals } = parseFlags(rest, {
+    booleanFlags: command === "whatsapp" ? ["daemon", "stop", "status", "daemon-child"] : [],
+  });
 
   if (command === "scan" || command === "bias") {
     return {
@@ -220,8 +227,24 @@ function parseCommand(argv) {
   }
 
   if (command === "whatsapp") {
+    const requestedModes = ["daemon", "stop", "status", "daemon-child"].filter(flag => flags[flag] === true);
+    if (requestedModes.length > 1) {
+      throw new UserError("whatsapp accepts only one of --daemon, --stop, or --status");
+    }
+
+    let mode = "foreground";
+    if (flags.daemon === true) {
+      mode = "daemon";
+    } else if (flags.stop === true) {
+      mode = "stop";
+    } else if (flags.status === true) {
+      mode = "status";
+    } else if (flags["daemon-child"] === true) {
+      mode = "daemon-child";
+    }
     return {
       command,
+      mode,
     };
   }
 
@@ -243,6 +266,9 @@ function formatHelpText() {
     "                            Calculate position size",
     "  resume                    Resume the latest saved session",
     "  whatsapp                  Start the WhatsApp gateway",
+    "  whatsapp --daemon         Start the WhatsApp gateway in the background",
+    "  whatsapp --stop           Stop the WhatsApp daemon",
+    "  whatsapp --status         Show WhatsApp daemon status",
     "",
     "Flags:",
     "  -h, --help                Show this help message",
@@ -1814,16 +1840,20 @@ async function runCli(overrides = {}) {
   const consoleLike = overrides.console || global.console;
   const fetchImpl = overrides.fetch || global.fetch;
   const config = overrides.config || configStore;
+  const skipUpdateCheck = overrides.skipUpdateCheck === true
+    || Boolean(overrides.env && overrides.env.PROPHET_DAEMON_CHILD === "1");
   if (typeof fetchImpl !== "function") {
     throw new UserError("This runtime does not provide fetch. Use Node.js 18 or newer.");
   }
 
-  const updateCheckPromise = startUpdateCheck({
-    currentVersion: overrides.currentVersion || CLI_VERSION,
-    packageName: overrides.packageName || PACKAGE_NAME,
-    updateCheckInterval: overrides.updateCheckInterval,
-    loadUpdateNotifier: overrides.loadUpdateNotifier,
-  });
+  const updateCheckPromise = skipUpdateCheck
+    ? Promise.resolve(null)
+    : startUpdateCheck({
+      currentVersion: overrides.currentVersion || CLI_VERSION,
+      packageName: overrides.packageName || PACKAGE_NAME,
+      updateCheckInterval: overrides.updateCheckInterval,
+      loadUpdateNotifier: overrides.loadUpdateNotifier,
+    });
 
   consoleLike.log(PROPHET_BANNER);
   consoleLike.log(PROPHET_VERSION_LINE);
@@ -1844,6 +1874,7 @@ async function runCli(overrides = {}) {
     const runGateway = overrides.runWhatsAppGateway || startWhatsAppGateway;
     return runGateway({
       ...overrides,
+      mode: parsed.mode,
       console: consoleLike,
       fetch: fetchImpl,
       config,
