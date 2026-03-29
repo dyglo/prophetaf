@@ -1809,3 +1809,31 @@ test("runCli warns and continues when profile lookup fails offline", async () =>
   assert.equal(profileAttempted, true);
   assert.ok(fakeConsole.messages.some(message => /could not verify your saved profile/i.test(message)));
 });
+
+test("runCli skips runner profile bootstrap for whatsapp mode", async () => {
+  const fakeConsole = createConsole();
+  let profileChecks = 0;
+  let gatewayCalls = 0;
+  const config = createConfigStub({ device_token: "device-123", display_name: "Tafar", onboarded: true });
+
+  const exitCode = await runCliForTest({
+    argv: ["whatsapp"],
+    console: fakeConsole,
+    config,
+    runWhatsAppGateway: async () => {
+      gatewayCalls += 1;
+      return 0;
+    },
+    fetch: async (url) => {
+      if (String(url).includes("/api/v1/profile")) {
+        profileChecks += 1;
+        return createJsonResponse({ display_name: "Tafar" });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(profileChecks, 0);
+  assert.equal(gatewayCalls, 1);
+});

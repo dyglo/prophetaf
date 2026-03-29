@@ -25,6 +25,7 @@ prophetaf
 - Live AI reasoning display during agent tool execution
 - SSE streaming chat responses from backend to CLI
 - Interactive selectors for models, pairs, sessions, and calendar views
+- WhatsApp gateway via QR scan using `whatsapp-web.js`
 
 ## Trading Methodology
 
@@ -53,6 +54,55 @@ prophetaf
 ## Architecture Overview
 
 `npm CLI client` -> `Cloud Run FastAPI backend` -> `LangChain agent` -> `OANDA/AlphaVantage/Finnhub data` -> `Gemini/OpenAI`
+
+## WhatsApp Gateway
+
+Prophet can run as a separate WhatsApp gateway process so you can message yourself on WhatsApp and receive Prophet replies back in the same chat.
+
+### Install
+
+```bash
+cd npm
+npm install
+```
+
+The gateway uses `whatsapp-web.js`, which runs through WhatsApp Web and does not require the WhatsApp Business API, a Meta developer account, or API keys.
+
+### First-Time Setup
+
+```bash
+prophetaf whatsapp
+```
+
+On the first run, Prophet will:
+
+1. Reuse or create your Prophet profile in `~/.prophet/config.json`
+2. Display a WhatsApp QR code in the terminal
+3. Save the linked WhatsApp auth session locally under `~/.prophet/whatsapp-session/`
+
+You can also run the dedicated login bootstrap directly:
+
+```bash
+cd npm
+npm run gateway:login
+```
+
+### Daily Use
+
+```bash
+prophetaf whatsapp
+```
+
+Or from the npm package directory:
+
+```bash
+cd npm
+npm run gateway
+```
+
+After the phone is linked, send a message to your own WhatsApp number. Prophet will intercept messages from that self-chat, send them to the hosted `/chat` backend, and reply back in plain text.
+
+The gateway keeps a dedicated local WhatsApp chat session id in `~/.prophet/whatsapp-chat.json`, so follow-up messages preserve Prophet conversation context just like the CLI. Existing slash commands such as `/memory`, `/calendar`, `/pairs`, `/sessions`, and `/help` also work through WhatsApp.
 
 ## Contributing
 

@@ -7,6 +7,7 @@ __pycache__/
 .hedge_fund/
 logs/
 .prophet/
+.prophet/whatsapp-session/
 npm/node_modules/
 dist/
 build/
