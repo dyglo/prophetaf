@@ -1,10 +1,29 @@
 "use strict";
 
 const fs = require("node:fs");
+const os = require("node:os");
+const childProcess = require("node:child_process");
 const { ensureGatewayProfile, GatewayError } = require("./backend");
 const { createInboundMessageHandler } = require("./inbound");
 const { SentMessageTracker } = require("./outbound");
 const { getWhatsAppSessionDir } = require("./state");
+
+const REQUIRED_CHROMIUM_LIBRARIES = [
+  "libnspr4",
+  "libnss3",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libdrm2",
+  "libxkbcommon0",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxfixes3",
+  "libxrandr2",
+  "libgbm1",
+  "libasound2",
+];
+const LINUX_CHROMIUM_INSTALL_COMMAND = `sudo apt-get install -y ${REQUIRED_CHROMIUM_LIBRARIES.join(" ")}`;
 
 function createDefaultClientFactory(whatsappModule) {
   return options => new whatsappModule.Client(options);
@@ -27,6 +46,96 @@ function createClientOptions(whatsappModule, config) {
       ],
     },
   };
+}
+
+function parseMissingLibraries(output) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.includes("=> not found"))
+    .map(line => line.split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+function resolveChromiumExecutablePath(options = {}) {
+  if (typeof options.getChromiumExecutablePath === "function") {
+    return options.getChromiumExecutablePath();
+  }
+  const candidates = [
+    () => require("puppeteer"),
+    () => require("puppeteer-core"),
+  ];
+
+  for (const loadCandidate of candidates) {
+    try {
+      const moduleValue = loadCandidate();
+      if (moduleValue && typeof moduleValue.executablePath === "function") {
+        const executablePath = moduleValue.executablePath();
+        if (typeof executablePath === "string" && executablePath.trim()) {
+          return executablePath;
+        }
+      }
+    } catch {
+      // Keep searching for the bundled Puppeteer dependency.
+    }
+  }
+
+  return "";
+}
+
+function checkLinuxChromiumDependencies(options = {}) {
+  const platform = options.platform || process.platform;
+  if (platform !== "linux") {
+    return { ok: true, skipped: true };
+  }
+
+  const executablePath = resolveChromiumExecutablePath(options);
+  if (!executablePath) {
+    return { ok: true, skipped: true };
+  }
+
+  const execFileSync = options.execFileSync || childProcess.execFileSync;
+  try {
+    const output = execFileSync("ldd", [executablePath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const missingLibraries = parseMissingLibraries(output);
+    if (missingLibraries.length === 0) {
+      return { ok: true, executablePath, missingLibraries: [] };
+    }
+    return {
+      ok: false,
+      executablePath,
+      missingLibraries,
+      installCommand: LINUX_CHROMIUM_INSTALL_COMMAND,
+    };
+  } catch (error) {
+    const output = `${error && error.stdout ? error.stdout : ""}\n${error && error.stderr ? error.stderr : ""}`;
+    const missingLibraries = parseMissingLibraries(output);
+    if (missingLibraries.length === 0) {
+      return { ok: true, executablePath, skipped: true };
+    }
+    return {
+      ok: false,
+      executablePath,
+      missingLibraries,
+      installCommand: LINUX_CHROMIUM_INSTALL_COMMAND,
+    };
+  }
+}
+
+function formatLinuxDependencyError(details) {
+  const missingText = Array.isArray(details && details.missingLibraries) && details.missingLibraries.length > 0
+    ? ` Missing libraries: ${details.missingLibraries.join(", ")}.`
+    : "";
+  return [
+    "Chromium is missing required Linux shared libraries before WhatsApp could start.",
+    missingText.trim(),
+    `On Ubuntu/Debian run: ${LINUX_CHROMIUM_INSTALL_COMMAND}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 async function startWhatsAppGateway(options = {}) {
@@ -53,6 +162,14 @@ async function startWhatsAppGateway(options = {}) {
   const tracker = options.tracker || new SentMessageTracker();
   const gatewayStartedAt = Number(options.gatewayStartedAt || Date.now());
   const client = createClient(createClientOptions(whatsappModule, config));
+  const dependencyCheck = checkLinuxChromiumDependencies({
+    platform: options.platform || os.platform(),
+    execFileSync: options.execFileSync,
+    getChromiumExecutablePath: options.getChromiumExecutablePath,
+  });
+  if (!dependencyCheck.ok) {
+    throw new GatewayError(formatLinuxDependencyError(dependencyCheck));
+  }
 
   let ownChatId = "";
   const handleInboundMessage = createInboundMessageHandler({
@@ -115,6 +232,10 @@ async function startWhatsAppGateway(options = {}) {
 }
 
 module.exports = {
+  checkLinuxChromiumDependencies,
   createClientOptions,
+  formatLinuxDependencyError,
+  LINUX_CHROMIUM_INSTALL_COMMAND,
+  REQUIRED_CHROMIUM_LIBRARIES,
   startWhatsAppGateway,
 };

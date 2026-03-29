@@ -27,6 +27,8 @@ const BACKEND_BASE_URL = "https://prophet-wwxjsbvhoa-uc.a.run.app";
 const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"];
 const UPDATE_CHECK_INTERVAL_MS = 1000 * 60 * 60;
 const UPDATE_NOTIFICATION_DELAY_MS = 2000;
+const FETCH_TIMEOUT_MS = 60_000;
+const FETCH_RETRY_COUNT = 1;
 const ANSI_RESET = "\u001b[0m";
 const ANSI_BOLD = "\u001b[1m";
 const ANSI_DIM = "\u001b[2m";
@@ -265,6 +267,78 @@ function buildDeviceHeaders(configModule = configStore) {
   return token ? { "X-Device-Token": token } : {};
 }
 
+function createFetchTimeoutError(timeoutMs) {
+  const error = new Error(`fetch timed out after ${timeoutMs}ms`);
+  error.name = "FetchTimeoutError";
+  error.code = "FETCH_TIMEOUT";
+  return error;
+}
+
+function isAbortError(error) {
+  if (!error) {
+    return false;
+  }
+  return error.name === "AbortError" || error.code === "ABORT_ERR";
+}
+
+function isRetryableFetchError(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.code === "FETCH_TIMEOUT") {
+    return true;
+  }
+  if (isAbortError(error)) {
+    return true;
+  }
+  return error instanceof Error;
+}
+
+async function fetchWithTimeout(fetchImpl, url, request, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : FETCH_TIMEOUT_MS;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = null;
+  const finalRequest = { ...(request || {}) };
+
+  if (controller) {
+    finalRequest.signal = controller.signal;
+    timeoutId = setTimeout(() => {
+      controller.abort(createFetchTimeoutError(timeoutMs));
+    }, timeoutMs);
+  }
+
+  try {
+    return await fetchImpl(url, finalRequest);
+  } catch (error) {
+    if (isAbortError(error) && controller && controller.signal && controller.signal.aborted) {
+      throw controller.signal.reason || createFetchTimeoutError(timeoutMs);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function fetchWithRetry(fetchImpl, url, request, options = {}) {
+  const retryCount = Number.isInteger(options.retryCount) ? options.retryCount : FETCH_RETRY_COUNT;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    try {
+      return await fetchWithTimeout(fetchImpl, url, request, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retryCount || !isRetryableFetchError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error("fetch failed");
+}
+
 async function requestJson(fetchImpl, path, payload, options = {}) {
   const method = options.method || "POST";
   const headers = { ...(options.headers || {}) };
@@ -277,7 +351,10 @@ async function requestJson(fetchImpl, path, payload, options = {}) {
     request.body = JSON.stringify(payload);
   }
 
-  const response = await fetchImpl(`${BACKEND_BASE_URL}${path}`, request);
+  const response = await fetchWithRetry(fetchImpl, `${BACKEND_BASE_URL}${path}`, request, {
+    timeoutMs: options.timeoutMs,
+    retryCount: options.retryCount,
+  });
 
   const text = await response.text();
   let data = null;
@@ -301,9 +378,12 @@ async function requestJson(fetchImpl, path, payload, options = {}) {
 
 async function requestGetJson(fetchImpl, path, query = null, options = {}) {
   const suffix = query ? `?${new URLSearchParams(query).toString()}` : "";
-  const response = await fetchImpl(`${BACKEND_BASE_URL}${path}${suffix}`, {
+  const response = await fetchWithRetry(fetchImpl, `${BACKEND_BASE_URL}${path}${suffix}`, {
     method: "GET",
     headers: { Accept: "application/json", ...(options.headers || {}) },
+  }, {
+    timeoutMs: options.timeoutMs,
+    retryCount: options.retryCount,
   });
   const text = await response.text();
   let data = null;
@@ -380,6 +460,8 @@ async function ensureProfile(fetchImpl, consoleLike, overrides = {}) {
   try {
     const profile = await requestGetJson(fetchImpl, "/api/v1/profile", null, {
       headers: requestHeaders(),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
     });
     consoleLike.log(formatWelcomeBackMessage(profile.display_name));
     return { status: "loaded", profile };
@@ -390,7 +472,6 @@ async function ensureProfile(fetchImpl, consoleLike, overrides = {}) {
       }
       return runOnboardingFlow();
     }
-    consoleLike.log("Warning: Prophet could not verify your saved profile. Continuing without profile sync.");
     return { status: "offline" };
   }
 }
@@ -876,7 +957,7 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
   );
   spinner.start();
 
-  const response = await fetchImpl(`${BACKEND_BASE_URL}/chat`, {
+  const response = await fetchWithRetry(fetchImpl, `${BACKEND_BASE_URL}/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -884,6 +965,9 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
       ...(options.headers || {}),
     },
     body: JSON.stringify({ ...payload, stream: true }),
+  }, {
+    timeoutMs: options.timeoutMs,
+    retryCount: options.retryCount,
   });
 
   if (!response.ok) {
@@ -964,6 +1048,11 @@ async function requestChat(fetchImpl, stream, payload, options = {}) {
     buffer = parseSseEvents(buffer, (eventName, eventPayload) => {
       if (eventName === "message" && eventPayload && typeof eventPayload.delta === "string") {
         if (!sawChunk) {
+          if (planSteps.length > 0 && !renderedPlan) {
+            stopSpinner();
+            renderPlanBlock(stream, planSteps, supportsStyle(stream));
+            renderedPlan = true;
+          }
           stopSpinner({ markChunk: true });
         } else {
           clearSpinnerTimer();
@@ -1038,7 +1127,11 @@ async function requestJsonWithSpinner(fetchImpl, stream, path, payload, options 
   );
   spinner.start();
   try {
-    return await requestJson(fetchImpl, path, payload, { headers: options.headers });
+    return await requestJson(fetchImpl, path, payload, {
+      headers: options.headers,
+      timeoutMs: options.timeoutMs,
+      retryCount: options.retryCount,
+    });
   } finally {
     spinner.stop();
   }
@@ -1422,6 +1515,8 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
     const payload = await requestJson(fetchImpl, `/sessions/resume/${encodeURIComponent(sessionRef)}`, null, {
       method: "POST",
       headers: requestHeaders(),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
     });
     sessionId = payload.id || sessionRef;
     history = Array.isArray(payload.messages) ? payload.messages.map(item => ({
@@ -1436,7 +1531,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
   };
 
   const resumeLatestSession = async () => {
-    const sessions = await requestGetJson(fetchImpl, "/sessions", null, { headers: requestHeaders() });
+    const sessions = await requestGetJson(fetchImpl, "/sessions", null, {
+      headers: requestHeaders(),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
+    });
     if (!Array.isArray(sessions) || sessions.length === 0) {
       consoleLike.log(stylize("No saved sessions found. Starting a new chat.", ANSI_GRAY, styled, { dim: true }));
       return false;
@@ -1462,6 +1561,8 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
     const data = await requestChat(fetchImpl, output, { ...buildPayload(prepared.message), ...prepared.payload }, {
       randomFn: overrides.randomFn,
       headers: requestHeaders(),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
     });
 
     sessionId = data.session_id || sessionId;
@@ -1478,7 +1579,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
     const payload = await requestJson(fetchImpl, "/chat", {
       ...buildPayload(command),
       stream: false,
-    }, { headers: requestHeaders() });
+    }, {
+      headers: requestHeaders(),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
+    });
     sessionId = payload.session_id || sessionId;
     return payload;
   };
@@ -1524,7 +1629,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
 
     if (trimmed === "/sessions") {
       try {
-        const sessions = await requestGetJson(fetchImpl, "/sessions", null, { headers: requestHeaders() });
+        const sessions = await requestGetJson(fetchImpl, "/sessions", null, {
+          headers: requestHeaders(),
+          timeoutMs: overrides.timeoutMs,
+          retryCount: overrides.retryCount,
+        });
         if (!Array.isArray(sessions) || sessions.length === 0) {
           renderChatResponse(consoleLike, { message: "No saved sessions yet.", metadata: {} }, { styled, output });
           return true;
@@ -1552,7 +1661,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
           { name: "This week", value: { view: "week" } },
         ];
         const selection = await runSelector((prompts, context) => prompts.select({ message: "Calendar view", choices }, context));
-        const payload = await requestGetJson(fetchImpl, "/calendar", { view: selection.view }, { headers: requestHeaders() });
+        const payload = await requestGetJson(fetchImpl, "/calendar", { view: selection.view }, {
+          headers: requestHeaders(),
+          timeoutMs: overrides.timeoutMs,
+          retryCount: overrides.retryCount,
+        });
         const message = formatCalendarPayload(payload);
         const response = { message, metadata: { ...payload, view: "calendar_picker" } };
         history.push({ role: "user", content: "/calendar", metadata: {} });
@@ -1580,7 +1693,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
         const response = await requestJson(fetchImpl, "/chat", {
           ...buildPayload(`/model ${selected}`),
           stream: false,
-        }, { headers: requestHeaders() });
+        }, {
+          headers: requestHeaders(),
+          timeoutMs: overrides.timeoutMs,
+          retryCount: overrides.retryCount,
+        });
         sessionId = response.session_id || sessionId;
         recordTurn(`/model ${selected}`, response);
         renderChatResponse(consoleLike, response, { styled, output });
@@ -1611,7 +1728,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
           const response = await requestJson(fetchImpl, "/chat", {
             ...buildPayload(`/pairs add ${pair}`),
             stream: false,
-          }, { headers: requestHeaders() });
+          }, {
+            headers: requestHeaders(),
+            timeoutMs: overrides.timeoutMs,
+            retryCount: overrides.retryCount,
+          });
           sessionId = response.session_id || sessionId;
           recordTurn(`/pairs add ${pair}`, response);
           renderChatResponse(consoleLike, response, { styled, output });
@@ -1622,7 +1743,11 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
         const response = await requestJson(fetchImpl, "/chat", {
           ...buildPayload(`/pairs remove ${pair}`),
           stream: false,
-        }, { headers: requestHeaders() });
+        }, {
+          headers: requestHeaders(),
+          timeoutMs: overrides.timeoutMs,
+          retryCount: overrides.retryCount,
+        });
         sessionId = response.session_id || sessionId;
         recordTurn(`/pairs remove ${pair}`, response);
         renderChatResponse(consoleLike, response, { styled, output });
@@ -1751,7 +1876,12 @@ async function runCli(overrides = {}) {
     overrides.stdout || process.stdout,
     `/${parsed.command}`,
     parsed.payload,
-    { randomFn: overrides.randomFn, headers: buildDeviceHeaders(config) },
+    {
+      randomFn: overrides.randomFn,
+      headers: buildDeviceHeaders(config),
+      timeoutMs: overrides.timeoutMs,
+      retryCount: overrides.retryCount,
+    },
   );
   printJson(consoleLike, data);
   return 0;

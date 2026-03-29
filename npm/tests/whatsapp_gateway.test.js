@@ -7,10 +7,16 @@ const os = require("node:os");
 const path = require("node:path");
 
 const { parseCommand, runCli } = require("../lib/runner");
+const { ensureGatewayProfile, WHATSAPP_SETUP_REQUIRED_MESSAGE } = require("../lib/whatsapp_gateway/backend");
 const { formatWhatsAppResponse } = require("../lib/whatsapp_gateway/formatting");
 const { createInboundMessageHandler, shouldProcessMessage } = require("../lib/whatsapp_gateway/inbound");
 const { SentMessageTracker } = require("../lib/whatsapp_gateway/outbound");
-const { startWhatsAppGateway } = require("../lib/whatsapp_gateway/runtime");
+const {
+  checkLinuxChromiumDependencies,
+  createClientOptions,
+  LINUX_CHROMIUM_INSTALL_COMMAND,
+  startWhatsAppGateway,
+} = require("../lib/whatsapp_gateway/runtime");
 const { readWhatsAppState } = require("../lib/whatsapp_gateway/state");
 
 function createConsole() {
@@ -83,6 +89,26 @@ test("runCli dispatches whatsapp mode to the gateway runtime", async () => {
   assert.equal(exitCode, 0);
   assert.ok(receivedOptions);
   assert.equal(typeof receivedOptions.fetch, "function");
+});
+
+test("createClientOptions includes the Linux-safe Chromium launch args", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, {
+    device_token: "device-123",
+    display_name: "Tafar",
+    onboarded: true,
+  });
+  const options = createClientOptions({
+    LocalAuth: class LocalAuth {
+      constructor(init) {
+        Object.assign(this, init);
+      }
+    },
+  }, config);
+
+  assert.ok(options.puppeteer.args.includes("--no-sandbox"));
+  assert.ok(options.puppeteer.args.includes("--disable-setuid-sandbox"));
+  assert.ok(options.puppeteer.args.includes("--disable-dev-shm-usage"));
 });
 
 test("formatWhatsAppResponse strips ansi and flattens structured command views", () => {
@@ -254,38 +280,158 @@ test("createInboundMessageHandler treats empty backend bodies as a non-throwing 
   assert.ok(fakeConsole.messages.some(message => message.includes("session new")));
 });
 
-test("startWhatsAppGateway bootstraps onboarding before initializing the client", async () => {
+test("ensureGatewayProfile fails clearly when the trader has not completed CLI setup", async () => {
+  await assert.rejects(
+    () => ensureGatewayProfile(async () => {
+      throw new Error("fetch should not run");
+    }, createConsole(), {
+      config: createConfigStub(path.join(os.tmpdir(), "prophetaf-whatsapp-missing"), null),
+    }),
+    error => {
+      assert.match(error.message, new RegExp(WHATSAPP_SETUP_REQUIRED_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      return true;
+    },
+  );
+});
+
+test("ensureGatewayProfile fails clearly when the backend rejects the saved profile", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, {
+    device_token: "device-123",
+    display_name: "Tafar",
+    onboarded: true,
+  });
+
+  await assert.rejects(
+    () => ensureGatewayProfile(async () => ({
+      ok: false,
+      status: 404,
+      async text() {
+        return JSON.stringify({ detail: "Profile not found" });
+      },
+    }), createConsole(), { config }),
+    error => {
+      assert.match(error.message, /Run prophetaf once in the terminal/i);
+      return true;
+    },
+  );
+});
+
+test("ensureGatewayProfile stays silent when profile verification fails offline", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, {
+    device_token: "device-123",
+    display_name: "Tafar",
+    onboarded: true,
+  });
+  const fakeConsole = createConsole();
+
+  const profile = await ensureGatewayProfile(async () => {
+    throw new Error("network offline");
+  }, fakeConsole, { config });
+
+  assert.deepEqual(profile, { status: "offline" });
+  assert.ok(!fakeConsole.messages.some(message => /could not verify your saved profile/i.test(message)));
+});
+
+test("checkLinuxChromiumDependencies reports missing shared libraries clearly", () => {
+  const result = checkLinuxChromiumDependencies({
+    platform: "linux",
+    getChromiumExecutablePath: () => "/tmp/chrome",
+    execFileSync() {
+      return [
+        "libnspr4.so => not found",
+        "libnss3.so => not found",
+      ].join("\n");
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.missingLibraries, ["libnspr4.so", "libnss3.so"]);
+  assert.equal(result.installCommand, LINUX_CHROMIUM_INSTALL_COMMAND);
+});
+
+test("startWhatsAppGateway fails before initialization when Linux Chromium dependencies are missing", async t => {
+  const tempDir = withTempDir(t);
+  const config = createConfigStub(tempDir, {
+    device_token: "device-123",
+    display_name: "Tafar",
+    onboarded: true,
+  });
+  let initializeCalls = 0;
+
+  await assert.rejects(
+    () => startWhatsAppGateway({
+      console: createConsole(),
+      config,
+      fetch: async (url) => {
+        if (String(url).includes("/api/v1/profile")) {
+          return {
+            ok: true,
+            status: 200,
+            async text() {
+              return JSON.stringify({ display_name: "Tafar" });
+            },
+          };
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+      platform: "linux",
+      getChromiumExecutablePath: () => "/tmp/chrome",
+      execFileSync() {
+        return "libnspr4.so => not found";
+      },
+      whatsappModule: {
+        LocalAuth: class LocalAuth {},
+      },
+      qrTerminal: {
+        generate() {},
+      },
+      createClient: () => ({
+        on() {},
+        async initialize() {
+          initializeCalls += 1;
+        },
+      }),
+    }),
+    error => {
+      assert.match(error.message, /missing required Linux shared libraries/i);
+      assert.match(error.message, /sudo apt-get install -y libnspr4/i);
+      return true;
+    },
+  );
+
+  assert.equal(initializeCalls, 0);
+});
+
+test("startWhatsAppGateway initializes directly when a saved profile exists", async t => {
   const fakeConsole = createConsole();
   const qrCalls = [];
   const registeredEvents = {};
-  let onboardingCalls = 0;
   let initializeCalls = 0;
   let destroyCalls = 0;
+  const tempDir = withTempDir(t);
 
   const exitCode = await startWhatsAppGateway({
     console: fakeConsole,
-    config: createConfigStub(path.join(os.tmpdir(), "prophetaf-whatsapp-missing"), null),
+    config: createConfigStub(tempDir, {
+      device_token: "device-123",
+      display_name: "Tafar",
+      onboarded: true,
+    }),
     fetch: async (url) => {
       if (String(url).includes("/api/v1/profile")) {
-        throw new Error("profile should not be checked before onboarding");
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({ display_name: "Tafar" });
+          },
+        };
       }
-      return {
-        ok: true,
-        status: 200,
-        async text() {
-          return "{}";
-        },
-      };
+      throw new Error(`Unexpected URL: ${url}`);
     },
-    runOnboarding: async ({ config }) => {
-      onboardingCalls += 1;
-      config.writeConfig({
-        device_token: "device-123",
-        display_name: "Tafar",
-        onboarded: true,
-      });
-      return { status: "completed" };
-    },
+    platform: "win32",
     qrTerminal: {
       generate(value) {
         qrCalls.push(value);
@@ -312,7 +458,6 @@ test("startWhatsAppGateway bootstraps onboarding before initializing the client"
   });
 
   assert.equal(exitCode, 0);
-  assert.equal(onboardingCalls, 1);
   assert.equal(initializeCalls, 1);
   assert.equal(qrCalls[0], "qr-token");
   assert.equal(destroyCalls, 1);
