@@ -209,29 +209,7 @@ def _load_or_create_state(
 def _is_streamable_message_by_settings(settings, message: str) -> bool:
     if not getattr(settings, "streaming", None):
         return True
-    if not settings.streaming.enabled:
-        return False
-    lowered = message.strip().lower()
-    if not lowered or lowered.startswith("/"):
-        return False
-    if any(phrase in lowered for phrase in ("trade plan", "plan this trade", "generate a plan")):
-        return True
-    if "entry" in lowered and ("stop" in lowered or "stop loss" in lowered):
-        return True
-    blocked_terms = (
-        "scan",
-        "bias",
-        "lot size",
-        "risk",
-        "calendar",
-        "event",
-        "news today",
-        "rank",
-        "best setup",
-        "focus on",
-        "compare",
-    )
-    return not any(term in lowered for term in blocked_terms)
+    return bool(settings.streaming.enabled)
 
 
 def _sse(event: str, data: dict) -> str:

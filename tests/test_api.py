@@ -260,6 +260,63 @@ def test_chat_endpoint_streams_sse_events(monkeypatch) -> None:
     assert created_repositories[0] is not request_session
 
 
+def test_chat_endpoint_streams_queries_that_used_to_fallback_to_json(monkeypatch) -> None:
+    class FakeService:
+        def process_message(self, state, message, authorize_mutation=None, event_sink=None, stream_handler=None):
+            assert message == "scan EURUSD and XAUUSD and find the best setup"
+            assert event_sink is not None
+            assert stream_handler is not None
+            event_sink.emit_plan("1. Scan EURUSD.\n2. Scan XAUUSD.")
+            stream_handler("Streaming enabled.")
+            return ChatResponse(session_id=state.session.session_id, message="Streaming enabled.")
+
+    class FakeRunner:
+        def __init__(self, context, cwd=None, session_store=None, repository=None) -> None:
+            self.closed = False
+
+        def build_service(self, model_override, append_system_prompt, device_token=None):
+            return FakeService()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = Settings.load()
+            self.logger = logging.getLogger("test")
+            self._worker_session = object()
+
+        def create_repository(self, session):
+            return session
+
+        @contextmanager
+        def session_scope(self):
+            yield self._worker_session
+
+    monkeypatch.setattr("hedge_fund.api.ChatCommandRunner", FakeRunner)
+
+    store = DatabaseSessionStore(_session_factory())
+    response = chat(
+        ChatRequest(message="scan EURUSD and XAUUSD and find the best setup", stream=True),
+        FakeContext(),
+        object(),
+        store,
+    )
+
+    chunks = []
+
+    async def collect() -> None:
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+
+    asyncio.run(collect())
+
+    combined = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+    assert "event: plan" in combined
+    assert "event: message" in combined
+    assert "event: done" in combined
+
+
 def test_chat_endpoint_prefers_history_over_messages(monkeypatch) -> None:
     observed = {}
 
