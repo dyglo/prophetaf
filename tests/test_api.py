@@ -194,6 +194,7 @@ def test_chat_endpoint_streams_sse_events(monkeypatch) -> None:
         def process_message(self, state, message, authorize_mutation=None, event_sink=None, stream_handler=None):
             assert stream_handler is not None
             assert event_sink is not None
+            event_sink.emit_plan("1. Check the watchlist.\n2. Compare the strongest setups.")
             event_sink.update_status("Scanning the watchlist...")
             event_sink.emit_reasoning("XAUUSD is starting to stand out, so I am checking it more closely.")
             stream_handler("Hello ")
@@ -244,6 +245,8 @@ def test_chat_endpoint_streams_sse_events(monkeypatch) -> None:
     asyncio.run(collect())
 
     combined = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+    assert "event: plan" in combined
+    assert '"message": "1. Check the watchlist.\\n2. Compare the strongest setups."' in combined
     assert "event: step" in combined
     assert '"message": "Scanning the watchlist..."' in combined
     assert "event: reasoning" in combined
@@ -251,6 +254,7 @@ def test_chat_endpoint_streams_sse_events(monkeypatch) -> None:
     assert "event: message" in combined
     assert '"delta": "Hello "' in combined
     assert "event: done" in combined
+    assert combined.index("event: plan") < combined.index("event: step")
     assert len(created_runners) == 1
     assert created_runners[0].closed is True
     assert created_repositories[0] is not request_session

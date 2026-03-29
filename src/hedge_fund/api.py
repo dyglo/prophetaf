@@ -244,6 +244,9 @@ class StreamingAgentEventSink(AgentEventSink):
     def update_status(self, message: str) -> None:
         self.queue.put(("step", {"message": message}))
 
+    def emit_plan(self, message: str) -> None:
+        self.queue.put(("plan", {"message": message}))
+
     def emit_reasoning(self, message: str) -> None:
         self.queue.put(("reasoning", {"message": message}))
 
@@ -384,6 +387,9 @@ def chat(
                 continue
             if kind == "step":
                 yield _sse("step", payload if isinstance(payload, dict) else {})
+                continue
+            if kind == "plan":
+                yield _sse("plan", payload if isinstance(payload, dict) else {})
                 continue
             if kind == "reasoning":
                 yield _sse("reasoning", payload if isinstance(payload, dict) else {})

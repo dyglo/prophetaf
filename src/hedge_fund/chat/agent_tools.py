@@ -31,6 +31,7 @@ class AgentToolContext:
     memory_repository: Any = None
     calendar_service: Any = None
     authorize_mutation: Callable[[str], bool] | None = None
+    tool_summary_handler: Callable[[str, dict[str, Any], dict[str, Any]], str] | None = None
 
     def build_tools(self) -> list[Any]:
         @tool
@@ -196,7 +197,6 @@ class AgentToolContext:
         ]
 
     def _run_tool(self, name: str, arguments: dict[str, Any], handler, *args) -> str:
-        self.scratchpad.log("tool_call", {"tool": name, "arguments": arguments})
         try:
             result = handler(*args)
         except Exception as exc:  # noqa: BLE001
@@ -205,8 +205,25 @@ class AgentToolContext:
                 "tool": name,
                 "error": str(exc),
             }
-        self.scratchpad.log("tool_result", {"tool": name, "result": result})
+        llm_summary = self._tool_summary(name, arguments, result)
+        self.scratchpad.log_tool_result(name, arguments, result, llm_summary)
         return json.dumps(result, default=str)
+
+    def _tool_summary(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> str:
+        if self.tool_summary_handler is not None:
+            try:
+                summary = self.tool_summary_handler(name, arguments, result)
+                if summary and summary.strip():
+                    return summary.strip()
+            except Exception:  # noqa: BLE001
+                pass
+        fallback = str(result.get("summary") or result.get("recommendation") or "").strip()
+        if fallback:
+            return fallback if fallback.endswith((".", "!", "?")) else f"{fallback}."
+        if result.get("ok") is False:
+            error = str(result.get("error") or "the tool returned an issue").strip()
+            return f"{name.replace('_', ' ')} hit an issue: {error}."
+        return f"{name.replace('_', ' ')} completed without a standout signal."
 
     def _get_market_bias(self, pair: str, all_pairs: bool) -> dict[str, Any]:
         pairs = self._resolve_pairs(pair, all_pairs)

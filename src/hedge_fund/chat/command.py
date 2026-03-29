@@ -53,6 +53,10 @@ class RichAgentEventSink(AgentEventSink):
     def update_status(self, message: str) -> None:
         self.status.update(f"[bold cyan]{message}[/bold cyan]")
 
+    def emit_plan(self, message: str) -> None:
+        if self.show_thinking:
+            console.log(f"[dim]{message}[/dim]")
+
     def emit_reasoning(self, message: str) -> None:
         if self.show_thinking:
             console.log(f"[dim]{message}[/dim]")

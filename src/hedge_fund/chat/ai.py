@@ -125,6 +125,55 @@ class ChatLanguageService:
             self.logger.warning("Tool reasoning fallback used: %s", "; ".join(failures))
         return self._heuristic_tool_reasoning(tool_name, phase, payload)
 
+    def summarize_tool_result(
+        self,
+        tool_name: str,
+        arguments: dict,
+        raw_result: dict,
+        *,
+        user_message: str = "",
+    ) -> str:
+        failures: list[str] = []
+        request = {
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "raw_result": raw_result,
+            "user_message": user_message,
+        }
+        for provider_name, model in self._providers():
+            try:
+                if provider_name == "gemini":
+                    return self._tool_result_summary_with_gemini(request, model)
+                return self._tool_result_summary_with_openai(request, model)
+            except ProviderError as exc:
+                failures.append(f"{provider_name}: {exc}")
+                self.logger.warning("Tool result summary provider %s failed: %s", provider_name, exc)
+        if failures:
+            self.logger.warning("Tool result summary fallback used: %s", "; ".join(failures))
+        return self._heuristic_tool_result_summary(tool_name, raw_result)
+
+    def plan_agent_run(
+        self,
+        user_message: str,
+        history_messages: list[dict] | None = None,
+    ) -> str | None:
+        failures: list[str] = []
+        request = {
+            "user_message": user_message,
+            "history_messages": history_messages or [],
+        }
+        for provider_name, model in self._providers():
+            try:
+                if provider_name == "gemini":
+                    return self._plan_agent_run_with_gemini(request, model)
+                return self._plan_agent_run_with_openai(request, model)
+            except ProviderError as exc:
+                failures.append(f"{provider_name}: {exc}")
+                self.logger.warning("Run planning provider %s failed: %s", provider_name, exc)
+        if failures:
+            self.logger.warning("Run planning fallback used: %s", "; ".join(failures))
+        return self._heuristic_agent_plan(user_message)
+
     def _providers(self) -> list[tuple[str, str]]:
         raw_override = (self.model_override or "").strip().lower()
         if raw_override == "auto":
@@ -195,6 +244,22 @@ class ChatLanguageService:
             "For phase='before', describe what you are checking next. "
             "For phase='after', describe the most relevant finding or lack of finding from the returned result. "
             "Stay concise, specific, and trader-focused."
+        )
+
+    def _tool_result_summary_prompt(self) -> str:
+        return (
+            "Summarize this tool result in exactly one trader-focused sentence. "
+            "Use only the provided tool name, arguments, and raw result. "
+            "Do not mention JSON, payloads, or internal IDs."
+        )
+
+    def _research_plan_prompt(self) -> str:
+        return (
+            "Decide whether this trading-assistant request likely needs two or more tool calls before answering well. "
+            "Return JSON only with keys needs_plan and steps. "
+            "When needs_plan is true, steps must contain 2 to 5 short research steps. "
+            "When needs_plan is false, steps must be an empty array. "
+            "Use trader-friendly wording and keep each step short."
         )
 
     def _route_with_openai(self, message: str, context: dict, model: str) -> dict:
@@ -331,6 +396,63 @@ class ChatLanguageService:
             raise ProviderError("OpenAI returned an empty response body")
         return self._normalize_reasoning_line(response.output_text)
 
+    def _tool_result_summary_with_openai(self, payload: dict, model: str) -> str:
+        if not self.env.openai_api_key:
+            raise ProviderError("Missing OPENAI_API_KEY")
+        try:
+            response = self.openai_client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": self._tool_result_summary_prompt()},
+                    {"role": "user", "content": json.dumps(payload, default=str)},
+                ],
+                reasoning={"effort": "minimal"},
+            )
+        except AuthenticationError as exc:
+            raise ProviderError("OpenAI authentication failed") from exc
+        except APITimeoutError as exc:
+            raise ProviderError("OpenAI request timed out") from exc
+        except APIConnectionError as exc:
+            raise ProviderError("OpenAI connection failed") from exc
+        except APIStatusError as exc:
+            raise ProviderError(f"OpenAI returned HTTP {exc.status_code}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"OpenAI request failed: {exc.__class__.__name__}") from exc
+        if not response.output_text or not response.output_text.strip():
+            raise ProviderError("OpenAI returned an empty response body")
+        return self._normalize_reasoning_line(response.output_text)
+
+    def _plan_agent_run_with_openai(self, payload: dict, model: str) -> str | None:
+        if not self.env.openai_api_key:
+            raise ProviderError("Missing OPENAI_API_KEY")
+        try:
+            response = self.openai_client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": self._research_plan_prompt()},
+                    {"role": "user", "content": json.dumps(payload, default=str)},
+                ],
+                reasoning={"effort": "minimal"},
+                text={"format": {"type": "json_object"}},
+            )
+        except AuthenticationError as exc:
+            raise ProviderError("OpenAI authentication failed") from exc
+        except APITimeoutError as exc:
+            raise ProviderError("OpenAI request timed out") from exc
+        except APIConnectionError as exc:
+            raise ProviderError("OpenAI connection failed") from exc
+        except APIStatusError as exc:
+            raise ProviderError(f"OpenAI returned HTTP {exc.status_code}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"OpenAI request failed: {exc.__class__.__name__}") from exc
+        if not response.output_text or not response.output_text.strip():
+            raise ProviderError("OpenAI returned an empty response body")
+        try:
+            parsed = json.loads(response.output_text)
+        except ValueError as exc:
+            raise ProviderError("OpenAI returned invalid JSON content") from exc
+        return self._coerce_plan(parsed)
+
     def _route_with_gemini(self, message: str, context: dict, model: str) -> dict:
         if not self.env.gemini_api_key:
             raise ProviderError("Missing GEMINI_API_KEY")
@@ -466,6 +588,58 @@ class ChatLanguageService:
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError("Gemini returned invalid text content") from exc
         return self._normalize_reasoning_line(text)
+
+    def _tool_result_summary_with_gemini(self, payload: dict, model: str) -> str:
+        if not self.env.gemini_api_key:
+            raise ProviderError("Missing GEMINI_API_KEY")
+        try:
+            response = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": self.env.gemini_api_key},
+                json={
+                    "systemInstruction": {"parts": [{"text": self._tool_result_summary_prompt()}]},
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": json.dumps(payload, default=str)}],
+                        }
+                    ],
+                    "generationConfig": {"temperature": 0.1},
+                },
+                timeout=self.settings.chat.response_timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError("Gemini request failed") from exc
+        if response.status_code != 200:
+            raise ProviderError(f"Gemini returned HTTP {response.status_code}")
+        try:
+            text = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("Gemini returned invalid text content") from exc
+        return self._normalize_reasoning_line(text)
+
+    def _plan_agent_run_with_gemini(self, payload: dict, model: str) -> str | None:
+        if not self.env.gemini_api_key:
+            raise ProviderError("Missing GEMINI_API_KEY")
+        try:
+            response = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": self.env.gemini_api_key},
+                json={
+                    "systemInstruction": {"parts": [{"text": self._research_plan_prompt()}]},
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": json.dumps(payload, default=str)}],
+                        }
+                    ],
+                    "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
+                },
+                timeout=self.settings.chat.response_timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError("Gemini request failed") from exc
+        return self._coerce_plan(self._parse_gemini_json(response))
 
     def _parse_gemini_json(self, response: httpx.Response) -> dict:
         if response.status_code != 200:
@@ -629,6 +803,48 @@ class ChatLanguageService:
             error = str(payload.get("error") or "the tool did not return a usable result").strip()
             return self._normalize_reasoning_line(f"That check hit an issue: {error}.")
         return self._normalize_reasoning_line(f"{tool_name.replace('_', ' ')} completed without a standout signal.")
+
+    def _heuristic_tool_result_summary(self, tool_name: str, payload: dict) -> str:
+        summary = str(payload.get("summary") or payload.get("recommendation") or "").strip()
+        if summary:
+            return self._normalize_reasoning_line(summary)
+        if payload.get("ok") is False:
+            error = str(payload.get("error") or "the tool returned an issue").strip()
+            return self._normalize_reasoning_line(f"{tool_name.replace('_', ' ')} hit an issue: {error}.")
+        return self._normalize_reasoning_line(f"{tool_name.replace('_', ' ')} completed without a standout signal.")
+
+    def _heuristic_agent_plan(self, user_message: str) -> str | None:
+        lowered = user_message.lower()
+        signals = 0
+        if any(term in lowered for term in ("news", "calendar", "event")):
+            signals += 1
+        if any(term in lowered for term in ("bias", "structure", "trend")):
+            signals += 1
+        if any(term in lowered for term in ("scan", "setup", "best setup", "compare", "rank")):
+            signals += 1
+        if any(term in lowered for term in ("risk", "lot size", "trade plan", "plan this trade")):
+            signals += 1
+        if signals < 2:
+            return None
+        return "\n".join(
+            [
+                "1. Confirm the live market context relevant to the request.",
+                "2. Pull the strongest supporting signals from the right internal tools.",
+                "3. Check whether risk, session timing, or news changes the trade decision.",
+            ]
+        )
+
+    def _coerce_plan(self, payload: dict) -> str | None:
+        needs_plan = bool(payload.get("needs_plan"))
+        raw_steps = payload.get("steps") or []
+        if not needs_plan:
+            return None
+        if not isinstance(raw_steps, list):
+            return None
+        steps = [" ".join(str(item).strip().split()) for item in raw_steps if str(item).strip()]
+        if len(steps) < 2:
+            return None
+        return "\n".join(f"{index}. {step}" for index, step in enumerate(steps[:5], start=1))
 
     def _normalize_reasoning_line(self, text: str) -> str:
         value = " ".join(str(text or "").strip().split())
