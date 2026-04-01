@@ -15,6 +15,7 @@ from hedge_fund.config.settings import Settings
 from hedge_fund.integrations.search.tavily import TavilySearchClient
 from hedge_fund.services.scan_service import RiskService, ScanService
 from hedge_fund.services.trade_plan_service import TradePlanService
+from hedge_fund.tools.run_backtest import run_backtest_payload
 
 
 @dataclass
@@ -176,6 +177,32 @@ class AgentToolContext:
             """Remove a forex pair from the watchlist when the user explicitly asks for it."""
             return self._run_tool("remove_watchlist_pair", {"pair": pair}, self._remove_watchlist_pair, pair)
 
+        @tool
+        def run_backtest(
+            pair: str,
+            granularity: str = "H1",
+            from_date: str = "",
+            to_date: str = "",
+            account_size: float = 10000.0,
+        ) -> str:
+            """Run a backtest of Prophet's FVG + Fibonacci + liquidity sweep strategy on historical data for a given pair."""
+            return self._run_tool(
+                "run_backtest",
+                {
+                    "pair": pair,
+                    "granularity": granularity,
+                    "from_date": from_date,
+                    "to_date": to_date,
+                    "account_size": account_size,
+                },
+                self._run_backtest,
+                pair,
+                granularity,
+                from_date,
+                to_date,
+                account_size,
+            )
+
         return [
             get_market_bias,
             scan_setups,
@@ -194,6 +221,7 @@ class AgentToolContext:
             show_risk_settings,
             add_watchlist_pair,
             remove_watchlist_pair,
+            run_backtest,
         ]
 
     def _run_tool(self, name: str, arguments: dict[str, Any], handler, *args) -> str:
@@ -509,6 +537,30 @@ class AgentToolContext:
 
     def _remove_watchlist_pair(self, pair: str) -> dict[str, Any]:
         return self._mutate_watchlist("remove", pair)
+
+    def _run_backtest(
+        self,
+        pair: str,
+        granularity: str,
+        from_date: str,
+        to_date: str,
+        account_size: float,
+    ) -> dict[str, Any]:
+        resolved_pair = self._resolve_pair(pair)
+        payload = run_backtest_payload(
+            pair=resolved_pair,
+            granularity=granularity or "H1",
+            from_date=from_date,
+            to_date=to_date,
+            account_size=account_size or 10000.0,
+            risk_pct=self.settings.trading.risk.default_risk_pct / 100,
+        )
+        self.artifacts.metadata["backtest"] = payload["backtest"]
+        self.artifacts.metadata["backtest_report"] = payload["report"]
+        self.state.session.context.active_pair = resolved_pair
+        self.state.session.context.last_intent = "backtest"
+        self.artifacts.summaries.append(f"Backtest: {payload['summary']}")
+        return payload
 
     def _mutate_watchlist(self, action: str, pair: str) -> dict[str, Any]:
         resolved_pair = self._resolve_pair(pair)

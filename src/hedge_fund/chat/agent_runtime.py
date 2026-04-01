@@ -177,6 +177,8 @@ class AgentRuntime:
             "suppress_model_stream": False,
             "trade_plan_message": "",
             "trade_plan_emitted": False,
+            "backtest_report_message": "",
+            "backtest_report_emitted": False,
         }
         if event_sink:
             event_sink.update_status("Thinking...")
@@ -221,6 +223,8 @@ class AgentRuntime:
 
         if render_state["trade_plan_message"]:
             final_message = render_state["trade_plan_message"]
+        elif render_state["backtest_report_message"]:
+            final_message = render_state["backtest_report_message"]
         if not final_message:
             if streamed_parts:
                 final_message = "".join(streamed_parts).strip()
@@ -302,6 +306,7 @@ class AgentRuntime:
                 )
                 event_sink.emit_reasoning(observation)
             self._capture_trade_plan(tool_info["name"], payload, artifacts, stream_handler, render_state)
+            self._capture_backtest_report(tool_info["name"], payload, artifacts, stream_handler, render_state)
             return
 
         if isinstance(message, AIMessage):
@@ -466,6 +471,7 @@ class AgentRuntime:
             "remember_rule": "Updating trader memory...",
             "forget_rule": "Updating trader memory...",
             "web_search": "Searching the web...",
+            "run_backtest": "Running backtest...",
         }
         return mapping.get(tool_name, "Analysing...")
 
@@ -495,6 +501,30 @@ class AgentRuntime:
         stream_handler("\n\n")
         stream_handler(trade_plan.formatted_block)
         render_state["trade_plan_emitted"] = True
+
+    def _capture_backtest_report(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        artifacts: AgentArtifacts,
+        stream_handler: Callable[[str], None] | None,
+        render_state: dict[str, Any],
+    ) -> None:
+        if tool_name != "run_backtest":
+            return
+        report = payload.get("report")
+        backtest_payload = payload.get("backtest")
+        if not isinstance(report, str) or not report.strip():
+            return
+        if isinstance(backtest_payload, dict):
+            artifacts.metadata["backtest"] = backtest_payload
+        artifacts.metadata["backtest_report"] = report
+        render_state["backtest_report_message"] = report
+        render_state["suppress_model_stream"] = True
+        if render_state["backtest_report_emitted"] or stream_handler is None:
+            return
+        stream_handler(report)
+        render_state["backtest_report_emitted"] = True
 
     def _build_plan(
         self,
