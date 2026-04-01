@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import traceback
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
@@ -26,6 +28,7 @@ from hedge_fund.services.calendar_service import CalendarService
 from hedge_fund.services.scan_service import RiskService, ScanService
 
 app = FastAPI(title="Prophet API")
+logger = logging.getLogger(__name__)
 
 
 class ClientChatMessage(BaseModel):
@@ -303,95 +306,100 @@ def chat(
     session_store: Annotated[DatabaseSessionStore, Depends(get_chat_session_store)],
     device_token: Annotated[str | None, Depends(get_device_token)] = None,
 ):
-    state = _load_or_create_state(request, context, session_store)
-    image_attachments = request.image_attachments()
+    try:
+        state = _load_or_create_state(request, context, session_store)
+        image_attachments = request.image_attachments()
 
-    _sync_request_history(state, request)
-    should_stream = request.stream and _is_streamable_message_by_settings(context.settings, request.message)
-    if not should_stream:
-        runner = ChatCommandRunner(
-            context,
-            cwd=Path(os.getcwd()),
-            session_store=session_store,
-            repository=context.create_repository(session),
-        )
-        service = runner.build_service(state.session.model_override, state.session.append_system_prompt, device_token=device_token)
-        memory_repository = _memory_repository_for(context, session, device_token)
-        if memory_repository is not None:
-            service.memory_repository = memory_repository
-        service.user_profile_repository = context.create_user_profile_repository(session) if device_token else None
-        try:
-            kwargs = {"image_attachments": image_attachments} if image_attachments else {}
-            return service.process_message(state, request.message, **kwargs)
-        finally:
-            runner.close()
-
-    def event_stream():
-        queue: Queue[tuple[str, object]] = Queue()
-
-        def worker() -> None:
-            worker_runner = None
+        _sync_request_history(state, request)
+        should_stream = request.stream and _is_streamable_message_by_settings(context.settings, request.message)
+        if not should_stream:
+            runner = ChatCommandRunner(
+                context,
+                cwd=Path(os.getcwd()),
+                session_store=session_store,
+                repository=context.create_repository(session),
+            )
+            service = runner.build_service(state.session.model_override, state.session.append_system_prompt, device_token=device_token)
+            memory_repository = _memory_repository_for(context, session, device_token)
+            if memory_repository is not None:
+                service.memory_repository = memory_repository
+            service.user_profile_repository = context.create_user_profile_repository(session) if device_token else None
             try:
-                with context.session_scope() as worker_session:
-                    worker_runner = ChatCommandRunner(
-                        context,
-                        cwd=Path(os.getcwd()),
-                        session_store=session_store,
-                        repository=context.create_repository(worker_session),
-                    )
-                    worker_service = worker_runner.build_service(
-                        state.session.model_override,
-                        state.session.append_system_prompt,
-                        device_token=device_token,
-                    )
-                    memory_repository = _memory_repository_for(context, worker_session, device_token)
-                    if memory_repository is not None:
-                        worker_service.memory_repository = memory_repository
-                    worker_service.user_profile_repository = context.create_user_profile_repository(worker_session) if device_token else None
-                    process_kwargs = {"image_attachments": image_attachments} if image_attachments else {}
-                    response = worker_service.process_message(
-                        state,
-                        request.message,
-                        event_sink=StreamingAgentEventSink(queue),
-                        stream_handler=lambda chunk: queue.put(("chunk", chunk)),
-                        **process_kwargs,
-                    )
-                queue.put(("response", response.model_dump(mode="json")))
-            except Exception as exc:  # noqa: BLE001
-                queue.put(("error", str(exc)))
+                kwargs = {"image_attachments": image_attachments} if image_attachments else {}
+                return service.process_message(state, request.message, **kwargs)
             finally:
-                if worker_runner is not None:
-                    worker_runner.close()
-                queue.put(("done", None))
+                runner.close()
 
-        Thread(target=worker, daemon=True).start()
-        while True:
-            try:
-                kind, payload = queue.get(timeout=0.1)
-            except Empty:
-                continue
-            if kind == "chunk":
-                yield _sse("message", {"delta": payload})
-                continue
-            if kind == "step":
-                yield _sse("step", payload if isinstance(payload, dict) else {})
-                continue
-            if kind == "plan":
-                yield _sse("plan", payload if isinstance(payload, dict) else {})
-                continue
-            if kind == "reasoning":
-                yield _sse("reasoning", payload if isinstance(payload, dict) else {})
-                continue
-            if kind == "response":
-                yield _sse("done", payload if isinstance(payload, dict) else {})
-                continue
-            if kind == "error":
-                yield _sse("error", {"message": payload})
-                continue
-            if kind == "done":
-                break
+        def event_stream():
+            queue: Queue[tuple[str, object]] = Queue()
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            def worker() -> None:
+                worker_runner = None
+                try:
+                    with context.session_scope() as worker_session:
+                        worker_runner = ChatCommandRunner(
+                            context,
+                            cwd=Path(os.getcwd()),
+                            session_store=session_store,
+                            repository=context.create_repository(worker_session),
+                        )
+                        worker_service = worker_runner.build_service(
+                            state.session.model_override,
+                            state.session.append_system_prompt,
+                            device_token=device_token,
+                        )
+                        memory_repository = _memory_repository_for(context, worker_session, device_token)
+                        if memory_repository is not None:
+                            worker_service.memory_repository = memory_repository
+                        worker_service.user_profile_repository = context.create_user_profile_repository(worker_session) if device_token else None
+                        process_kwargs = {"image_attachments": image_attachments} if image_attachments else {}
+                        response = worker_service.process_message(
+                            state,
+                            request.message,
+                            event_sink=StreamingAgentEventSink(queue),
+                            stream_handler=lambda chunk: queue.put(("chunk", chunk)),
+                            **process_kwargs,
+                        )
+                    queue.put(("response", response.model_dump(mode="json")))
+                except Exception as exc:  # noqa: BLE001
+                    queue.put(("error", str(exc)))
+                finally:
+                    if worker_runner is not None:
+                        worker_runner.close()
+                    queue.put(("done", None))
+
+            Thread(target=worker, daemon=True).start()
+            while True:
+                try:
+                    kind, payload = queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if kind == "chunk":
+                    yield _sse("message", {"delta": payload})
+                    continue
+                if kind == "step":
+                    yield _sse("step", payload if isinstance(payload, dict) else {})
+                    continue
+                if kind == "plan":
+                    yield _sse("plan", payload if isinstance(payload, dict) else {})
+                    continue
+                if kind == "reasoning":
+                    yield _sse("reasoning", payload if isinstance(payload, dict) else {})
+                    continue
+                if kind == "response":
+                    yield _sse("done", payload if isinstance(payload, dict) else {})
+                    continue
+                if kind == "error":
+                    yield _sse("error", {"message": payload})
+                    continue
+                if kind == "done":
+                    break
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"CHAT_ERROR: {type(exc).__name__}: {exc}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 @app.post("/scan")
