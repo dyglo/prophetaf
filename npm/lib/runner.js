@@ -4,12 +4,18 @@ const { name: PACKAGE_NAME, version: CLI_VERSION } = require("../package.json");
 const readline = require("node:readline/promises");
 const configStore = require("./config");
 const {
+  drawInputBoxBottom,
+  drawInputBoxTop,
+  getPromptString,
+} = require("./inputBox");
+const {
   detectImagePaths,
   readImageAsBase64,
   stripImagePathsFromMessage,
   validateImageFile,
 } = require("./image_handler");
 const { runOnboarding } = require("./onboarding");
+const theme = require("./theme");
 const { startWhatsAppGateway } = require("./whatsapp_gateway/runtime");
 let updateNotifierModulePromise;
 
@@ -33,16 +39,15 @@ const ANSI_RESET = "\u001b[0m";
 const ANSI_BOLD = "\u001b[1m";
 const ANSI_DIM = "\u001b[2m";
 const ANSI_CYAN = "\u001b[36m";
-const ANSI_BLUE = "\u001b[34m";
-const ANSI_GREEN = "\u001b[32m";
-const ANSI_YELLOW = "\u001b[33m";
-const ANSI_MAGENTA = "\u001b[35m";
 const ANSI_WHITE = "\u001b[37m";
-const ANSI_GRAY = "\u001b[90m";
 const ANSI_STRIP_PATTERN = /\u001b\[[0-9;]*m/g;
 const EXPLICIT_WEB_HINT_PATTERN = /\b(headline|headlines|breaking|news|live news|latest news|search the web|web search|look up|look this up|search online)\b/i;
 const EVENT_RISK_PATTERN = /\b(cpi|nfp|fomc|fed|ecb|boe|boj|tariff|geopolitical|rate decision|inflation print)\b/i;
 const RECENCY_PATTERN = /\b(today|latest|current|live|now|recent)\b/i;
+const SUPPORTED_PAIRS = new Set(["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF"]);
+const BULLISH_TOKENS = new Set(["Bullish", "bullish", "Long", "long"]);
+const BEARISH_TOKENS = new Set(["Bearish", "bearish", "Short", "short"]);
+const RESPONSE_TOKEN_PATTERN = /\b(XAUUSD|EURUSD|GBPUSD|USDJPY|USDCHF|Bullish|bullish|Long|long|Bearish|bearish|Short|short)\b/g;
 
 const LABEL_SETS = {
   scan: [
@@ -120,12 +125,12 @@ const LABEL_SETS = {
 };
 
 const SPINNER_THEME = {
-  scan: { frame: ANSI_CYAN, label: ANSI_WHITE },
-  bias: { frame: ANSI_GREEN, label: ANSI_WHITE },
-  risk: { frame: ANSI_YELLOW, label: ANSI_WHITE },
-  command: { frame: ANSI_MAGENTA, label: ANSI_WHITE },
-  web: { frame: ANSI_BLUE, label: ANSI_YELLOW },
-  chat: { frame: ANSI_CYAN, label: ANSI_WHITE },
+  scan: { frame: theme.toolCall, label: theme.response },
+  bias: { frame: theme.bull, label: theme.response },
+  risk: { frame: theme.warningBold, label: theme.response },
+  command: { frame: theme.toolCall, label: theme.system },
+  web: { frame: theme.system, label: theme.warningBold },
+  chat: { frame: theme.system, label: theme.response },
 };
 
 class UserError extends Error {
@@ -607,6 +612,14 @@ function stylize(text, color, enabled, options = {}) {
   return `${open}${text}${ANSI_RESET}`;
 }
 
+function applyTheme(text, formatter, enabled) {
+  const value = String(text || "");
+  if (!enabled || typeof formatter !== "function") {
+    return value;
+  }
+  return formatter(value);
+}
+
 function visibleLength(text) {
   return String(text || "").replace(ANSI_STRIP_PATTERN, "").length;
 }
@@ -817,10 +830,10 @@ function loadingLabelsFor(path, payload, options = {}) {
   return shuffleLabels(LABEL_SETS[mode], options.randomFn);
 }
 
-function formatSpinnerText(frame, label, theme, enabled) {
-  const frameText = stylize(frame, theme.frame, enabled, { bold: true });
-  const labelText = stylize(label, theme.label, enabled, { bold: true });
-  const trail = stylize("  •  Prophet is working", ANSI_GRAY, enabled, { dim: true });
+function formatSpinnerText(frame, label, spinnerTheme, enabled) {
+  const frameText = applyTheme(frame, spinnerTheme.frame, enabled);
+  const labelText = applyTheme(label, spinnerTheme.label, enabled);
+  const trail = applyTheme("  •  Prophet is working", theme.dim, enabled);
   return `${frameText} ${labelText}${trail}`;
 }
 
@@ -1186,8 +1199,8 @@ function restoreInlineSegments(text, segments, styled) {
   let value = text;
   for (const segment of segments) {
     const rendered = segment.style === "code"
-      ? stylize(segment.text, ANSI_CYAN, styled, { bold: true })
-      : stylize(segment.text, ANSI_WHITE, styled, { bold: true });
+      ? applyTheme(segment.text, theme.system, styled)
+      : applyTheme(segment.text, theme.responseBold, styled);
     value = value.replace(segment.token, rendered);
   }
   return value;
@@ -1208,22 +1221,55 @@ function formatMarkdownMessage(message, options = {}) {
 
       const headingMatch = value.match(/^#{1,6}\s*(.+)$/);
       if (headingMatch) {
-        return stylize(restoreInlineSegments(headingMatch[1], segments, styled), ANSI_YELLOW, styled, { bold: true });
+        return applyTheme(restoreInlineSegments(headingMatch[1], segments, styled), theme.toolCall, styled);
       }
 
       const bulletMatch = value.match(/^[-*]\s+(.+)$/);
       if (bulletMatch) {
-        return `${stylize("•", ANSI_CYAN, styled, { bold: true })} ${restoreInlineSegments(bulletMatch[1], segments, styled)}`;
+        return `${applyTheme("•", theme.toolCall, styled)} ${restoreInlineSegments(bulletMatch[1], segments, styled)}`;
       }
 
       const numberedMatch = value.match(/^(\d+)\.\s+(.+)$/);
       if (numberedMatch) {
-        return `${stylize(`${numberedMatch[1]}.`, ANSI_CYAN, styled, { bold: true })} ${restoreInlineSegments(numberedMatch[2], segments, styled)}`;
+        return `${applyTheme(`${numberedMatch[1]}.`, theme.toolCall, styled)} ${restoreInlineSegments(numberedMatch[2], segments, styled)}`;
       }
 
       return restoreInlineSegments(value, segments, styled);
     })
     .join("\n");
+}
+
+function styleResponseText(text, styled) {
+  const value = String(text || "");
+  if (!styled) {
+    return value;
+  }
+
+  let cursor = 0;
+  let rendered = "";
+  for (const match of value.matchAll(RESPONSE_TOKEN_PATTERN)) {
+    const token = match[0];
+    const index = match.index ?? 0;
+    if (index > cursor) {
+      rendered += theme.response(value.slice(cursor, index));
+    }
+    if (SUPPORTED_PAIRS.has(token)) {
+      rendered += theme.pair(token);
+    } else if (BULLISH_TOKENS.has(token)) {
+      rendered += theme.bull(token);
+    } else if (BEARISH_TOKENS.has(token)) {
+      rendered += theme.bear(token);
+    } else {
+      rendered += theme.response(token);
+    }
+    cursor = index + token.length;
+  }
+
+  if (cursor < value.length) {
+    rendered += theme.response(value.slice(cursor));
+  }
+
+  return rendered || theme.response(value);
 }
 
 function normalizePlanSteps(payload) {
@@ -1268,13 +1314,27 @@ function renderPlanBlock(output, steps, styled) {
   }
 
   const width = getWrapWidth(output);
-  const heading = stylize("Prophet is planning...", ANSI_GRAY, styled, { dim: true });
+  const heading = applyTheme("Prophet is planning...", theme.dim, styled);
   const renderedSteps = steps
-    .map((step, index) => wrapText(step, width, {
-      firstIndent: `  ${index + 1}. `,
-      restIndent: "     ",
-    }))
-    .map(text => stylize(text, ANSI_GRAY, styled, { dim: true }))
+    .map((step, index) => {
+      const prefixPlain = `  ${index + 1}. `;
+      const renderedPrefix = applyTheme(prefixPlain, theme.toolCall, styled);
+      const wrappedLines = wrapText(step, width, {
+        firstIndent: prefixPlain,
+        restIndent: "     ",
+      }).split("\n");
+      return wrappedLines
+        .map((line, lineIndex) => {
+          if (!styled) {
+            return line;
+          }
+          if (lineIndex === 0 && line.startsWith(prefixPlain)) {
+            return `${renderedPrefix}${applyTheme(line.slice(prefixPlain.length), theme.reasoning, styled)}`;
+          }
+          return applyTheme(line, theme.reasoning, styled);
+        })
+        .join("\n");
+    })
     .join("\n");
 
   writeLine(output, `\n${heading}\n\n${renderedSteps}\n\n`);
@@ -1288,7 +1348,7 @@ function renderValidationFlags(consoleLike, flags, options = {}) {
   const styled = Boolean(options.styled);
   const width = getWrapWidth(options.output);
   const prefixPlain = "⚠  ";
-  const prefix = stylize(prefixPlain, ANSI_YELLOW, styled, { bold: true });
+  const prefix = applyTheme(prefixPlain, theme.warningBold, styled);
   const continuation = "   ";
   const rendered = flags
     .map(flag => wrapText(flag, width, {
@@ -1301,9 +1361,9 @@ function renderValidationFlags(consoleLike, flags, options = {}) {
           return line;
         }
         if (index === 0 && line.startsWith(prefixPlain)) {
-          return `${prefix}${stylize(line.slice(prefixPlain.length), ANSI_YELLOW, styled)}`;
+          return `${prefix}${applyTheme(line.slice(prefixPlain.length), theme.warningText, styled)}`;
         }
-        return stylize(line, ANSI_YELLOW, styled);
+        return applyTheme(line, theme.warningText, styled);
       })
       .join("\n"))
     .join("\n");
@@ -1323,7 +1383,7 @@ function renderHelpMenu(consoleLike, commands, options = {}) {
     if (!command || !description) {
       continue;
     }
-    const commandText = stylize(command.padEnd(13), ANSI_CYAN, styled, { bold: true });
+    const commandText = applyTheme(command.padEnd(13), theme.toolCall, styled);
     const firstIndent = `  ${commandText} `;
     const restIndent = " ".repeat(visibleLength(firstIndent));
     const line = `${firstIndent}${description}`;
@@ -1344,7 +1404,7 @@ function renderModelPicker(consoleLike, metadata, options = {}) {
   const styled = Boolean(options.styled);
   const width = getWrapWidth(options.output);
   if (metadata.current) {
-    const line = `${stylize("Current model:", ANSI_YELLOW, styled, { bold: true })} ${metadata.current}`;
+    const line = `${applyTheme("Current model:", theme.system, styled)} ${applyTheme(metadata.current, theme.response, styled)}`;
     consoleLike.log(visibleLength(line) <= width ? line : wrapText(line, width));
   }
   if (!Array.isArray(metadata.options)) {
@@ -1356,18 +1416,18 @@ function renderModelPicker(consoleLike, metadata, options = {}) {
     if (!name || !detail) {
       continue;
     }
-    const detailLine = `  ${stylize(name.padEnd(8), ANSI_CYAN, styled, { bold: true })} ${detail}`;
+    const detailLine = `  ${applyTheme(name.padEnd(8), theme.toolCall, styled)} ${applyTheme(detail, theme.response, styled)}`;
     consoleLike.log(visibleLength(detailLine) <= width
       ? detailLine
-      : wrapText(`${stylize(name.padEnd(8), ANSI_CYAN, styled, { bold: true })} ${detail}`, width, {
+      : wrapText(`${applyTheme(name.padEnd(8), theme.toolCall, styled)} ${applyTheme(detail, theme.response, styled)}`, width, {
         firstIndent: "  ",
         restIndent: "           ",
       }));
     if (note) {
-      const noteLine = `           ${stylize(note, ANSI_GRAY, styled, { dim: true })}`;
+      const noteLine = `           ${applyTheme(note, theme.dim, styled)}`;
       consoleLike.log(visibleLength(noteLine) <= width
         ? noteLine
-        : wrapText(`${stylize(note, ANSI_GRAY, styled, { dim: true })}`, width, {
+        : wrapText(`${applyTheme(note, theme.dim, styled)}`, width, {
           firstIndent: "           ",
           restIndent: "           ",
         }));
@@ -1377,10 +1437,10 @@ function renderModelPicker(consoleLike, metadata, options = {}) {
 
 function renderChatResponse(consoleLike, data, options = {}) {
   const styled = Boolean(options.styled);
-  const prefix = stylize("Prophet>", ANSI_YELLOW, styled, { bold: true });
+  const prefix = applyTheme("Prophet>", theme.toolCall, styled);
   const width = getWrapWidth(options.output);
   const indent = " ".repeat(visibleLength(prefix) + 1);
-  const wrapped = wrapText(stripMarkdownSyntax(data.message), width, {
+  const wrapped = wrapText(styleResponseText(stripMarkdownSyntax(data.message), styled), width, {
     firstIndent: `${prefix} `,
     restIndent: indent,
   });
@@ -1404,7 +1464,7 @@ function renderChatResponse(consoleLike, data, options = {}) {
 }
 
 function renderStreamedPrefix(output, styled) {
-  const prefix = stylize("Prophet>", ANSI_YELLOW, styled, { bold: true });
+  const prefix = applyTheme("Prophet>", theme.toolCall, styled);
   writeLine(output, `\n${prefix} `);
   return visibleLength(prefix) + 1;
 }
@@ -1415,7 +1475,7 @@ function renderReasoningLine(output, message, styled) {
     return;
   }
   const width = getWrapWidth(output);
-  const bullet = stylize("◆", ANSI_GRAY, styled, { bold: true });
+  const bullet = applyTheme("◆", theme.toolCall, styled);
   const bulletPlain = "◆";
   const wrappedLines = wrapText(text, width, {
     firstIndent: `${bulletPlain} `,
@@ -1424,11 +1484,11 @@ function renderReasoningLine(output, message, styled) {
     .split("\n");
   if (styled && wrappedLines.length > 0) {
     const firstBody = wrappedLines[0].slice(bulletPlain.length + 1);
-    wrappedLines[0] = `${bullet} ${stylize(firstBody, ANSI_GRAY, styled, { dim: true })}`;
+    wrappedLines[0] = `${bullet} ${applyTheme(firstBody, theme.reasoning, styled)}`;
   }
   const rendered = wrappedLines.map((line, index) => (styled && index === 0
     ? line
-    : stylize(line, ANSI_GRAY, styled, { dim: true })));
+    : applyTheme(line, theme.reasoning, styled)));
   writeLine(output, `${rendered.join("\n")}\n`);
 }
 
@@ -1563,7 +1623,7 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
       retryCount: overrides.retryCount,
     });
     if (!Array.isArray(sessions) || sessions.length === 0) {
-      consoleLike.log(stylize("No saved sessions found. Starting a new chat.", ANSI_GRAY, styled, { dim: true }));
+      consoleLike.log(applyTheme("No saved sessions found. Starting a new chat.", theme.dim, styled));
       return false;
     }
     await resumeSession(sessions[0].id);
@@ -1799,7 +1859,7 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
   }
 
   let promptVisible = false;
-  consoleLike.log(stylize("Chat session starting... Type /help for commands. Type exit or quit to leave.", ANSI_GRAY, styled, { dim: true }));
+  consoleLike.log(applyTheme("Chat session starting... Type /help for commands. Type exit or quit to leave.", theme.dim, styled));
   try {
     activeRl = readline.createInterface({
       input,
@@ -1808,10 +1868,17 @@ async function runChat(consoleLike, fetchImpl, overrides, initialMessage) {
     while (true) {
       promptVisible = true;
       let answer;
+      const shouldBoxPrompt = supportsInteractive(input, output);
       try {
-        answer = await activeRl.question("> ");
+        if (shouldBoxPrompt) {
+          drawInputBoxTop(output);
+        }
+        answer = await activeRl.question(shouldBoxPrompt ? getPromptString() : "> ");
       } finally {
         promptVisible = false;
+        if (shouldBoxPrompt) {
+          drawInputBoxBottom(output);
+        }
       }
 
       const interactiveHandled = await handleInteractiveSlashCommand(answer);
@@ -1937,6 +2004,7 @@ module.exports = {
   renderPlanBlock,
   renderReasoningLine,
   renderValidationFlags,
+  styleResponseText,
   runCli,
   shuffleLabels,
   startUpdateCheck,

@@ -7,6 +7,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { PassThrough } = require("node:stream");
 const { version: CLI_VERSION } = require("../package.json");
+const {
+  drawInputBoxBottom,
+  drawInputBoxTop,
+  getPromptString,
+} = require("../lib/inputBox");
+const theme = require("../lib/theme");
 
 const {
   BACKEND_BASE_URL,
@@ -26,6 +32,7 @@ const {
   renderValidationFlags,
   runCli,
   shuffleLabels,
+  styleResponseText,
   startUpdateCheck,
 } = require("../lib/runner");
 
@@ -303,9 +310,9 @@ test("shuffleLabels preserves all labels", () => {
 });
 
 test("formatSpinnerText adds design accents for tty output", () => {
-  const text = formatSpinnerText("◐", "Searching the web...", { frame: "\u001b[34m", label: "\u001b[33m" }, true);
+  const text = formatSpinnerText("◐", "Searching the web...", { frame: theme.system, label: theme.warningBold }, true);
 
-  assert.match(text, /\u001b\[34m/);
+  assert.match(text, /\u001b\[/);
   assert.match(text, /Searching the web/);
   assert.match(text, /Prophet is working/);
 });
@@ -746,7 +753,39 @@ test("renderReasoningLine preserves dim gray styling after the bullet", () => {
   renderReasoningLine(stream, "Gold is leading the watchlist right now.", true);
 
   const rendered = stream.writes.join("");
-  assert.match(rendered, /\u001b\[1m\u001b\[90m◆\u001b\[0m \u001b\[2m\u001b\[90mGold is leading the watchlist right now\.\u001b\[0m/);
+  assert.match(rendered, /◆/);
+  assert.match(rendered, /\u001b\[/);
+  assert.match(rendered, /38;2;217;119;87/);
+  assert.match(rendered, /38;2;106;155;204/);
+});
+
+test("styleResponseText highlights supported pairs and directional words", () => {
+  const rendered = styleResponseText("XAUUSD stays Bullish while USDCHF turns Bearish.", true);
+
+  assert.equal(stripAnsi(rendered), "XAUUSD stays Bullish while USDCHF turns Bearish.");
+  assert.match(rendered, /38;2;217;119;87/);
+  assert.match(rendered, /38;2;120;140;93/);
+  assert.match(rendered, /38;2;192;57;43/);
+});
+
+test("theme semantic helpers return styled strings", () => {
+  assert.ok(theme.toolCall("◆ scan").length > 0);
+  assert.ok(theme.warn("Rule check").length > 0);
+  assert.ok(theme.bull("Bullish").length > 0);
+  assert.ok(theme.bear("Bearish").length > 0);
+});
+
+test("input box helpers draw the bordered prompt", () => {
+  const stream = createStream({ isTTY: true, columns: 24 });
+
+  drawInputBoxTop(stream);
+  stream.write(getPromptString());
+  drawInputBoxBottom(stream);
+
+  const rendered = stripAnsi(stream.writes.join(""));
+  assert.match(rendered, /┌/);
+  assert.match(rendered, /│ > /);
+  assert.match(rendered, /└/);
 });
 
 test("normalizePlanSteps supports steps and plan arrays", () => {
@@ -1182,9 +1221,54 @@ test("runCli uses a selector for /model in tty mode", async () => {
   assert.equal(JSON.parse(calls[0].options.body).message, "/model");
   assert.equal(JSON.parse(calls[1].options.body).message, "/model openai");
   assert.equal(JSON.parse(calls[2].options.body).message, "What is the current trend of EURUSD?");
-  assert.ok(stdout.writes.filter(chunk => chunk.includes("> ")).length >= 2);
+  const renderedOutput = stripAnsi(stdout.writes.join(""));
+  assert.match(renderedOutput, /┌/);
+  assert.ok((renderedOutput.match(/│ > /g) || []).length >= 2);
   assert.deepEqual(JSON.parse(calls[0].options.body).history, [{ role: "user", content: "/model", metadata: {} }]);
   assert.deepEqual(JSON.parse(calls[1].options.body).history, [{ role: "user", content: "/model openai", metadata: {} }]);
+});
+
+test("runCli keeps the plain prompt for non-tty chat input", async () => {
+  const fakeConsole = createConsole();
+  const stdout = new PassThrough();
+  stdout.isTTY = false;
+  stdout.writes = [];
+  const originalWrite = stdout.write.bind(stdout);
+  stdout.write = chunk => {
+    stdout.writes.push(String(chunk));
+    return originalWrite(chunk);
+  };
+  const stdin = new PassThrough();
+  stdin.isTTY = false;
+  const calls = [];
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    return createJsonResponse({
+      message: "Session closed.",
+      session_id: "abc123",
+      metadata: {},
+      should_exit: true,
+    });
+  };
+
+  const runPromise = runCliForTest({
+    argv: [],
+    console: fakeConsole,
+    fetch,
+    stdin,
+    stdout,
+  });
+
+  await new Promise(resolve => setImmediate(resolve));
+  stdin.end("quit\n");
+
+  const exitCode = await runPromise;
+  const renderedOutput = stripAnsi(stdout.writes.join(""));
+
+  assert.equal(exitCode, 0);
+  assert.equal(calls.length, 0);
+  assert.match(renderedOutput, /> /);
+  assert.doesNotMatch(renderedOutput, /┌|└|│/);
 });
 
 test("runCli uses a selector for /pairs in tty mode", async () => {
@@ -1419,7 +1503,7 @@ test("runCli keeps the chat loop responsive after repeated selector commands", a
   assert.equal(modelSelections, 3);
   assert.equal(calendarSelections, 2);
   assert.equal(calls.filter(call => call.url === `${BACKEND_BASE_URL}/chat`).length, 7);
-  assert.match(fakeConsole.messages.at(-1), /EURUSD stays constructive/);
+  assert.match(stripAnsi(fakeConsole.messages.at(-1)), /EURUSD stays constructive/);
 });
 
 test("runCli does not abort selector signals after a successful selection", async () => {
