@@ -1,7 +1,54 @@
 "use strict";
 
-const chalkModule = require("chalk");
-const chalk = new chalkModule.Instance({ level: 3 });
+function createFallbackChalk() {
+  const applyStyle = (text, { rgb, bold = false } = {}) => {
+    const codes = [];
+    if (bold) {
+      codes.push("1");
+    }
+    if (Array.isArray(rgb) && rgb.length === 3) {
+      codes.push(`38;2;${rgb[0]};${rgb[1]};${rgb[2]}`);
+    }
+    if (codes.length === 0) {
+      return String(text);
+    }
+    return `\u001b[${codes.join(";")}m${String(text)}\u001b[39m${bold ? "\u001b[22m" : ""}`;
+  };
+
+  return {
+    hex(hex) {
+      const normalized = String(hex || "").replace(/^#/, "");
+      const rgb = normalized.length === 6
+        ? [
+            Number.parseInt(normalized.slice(0, 2), 16),
+            Number.parseInt(normalized.slice(2, 4), 16),
+            Number.parseInt(normalized.slice(4, 6), 16),
+          ]
+        : null;
+
+      const colorize = text => applyStyle(text, { rgb });
+      colorize.bold = text => applyStyle(text, { rgb, bold: true });
+      return colorize;
+    },
+  };
+}
+
+function loadChalk() {
+  try {
+    const chalkModule = require("chalk");
+    if (chalkModule && typeof chalkModule.Instance === "function") {
+      return new chalkModule.Instance({ level: 3 });
+    }
+    if (chalkModule && typeof chalkModule.hex === "function") {
+      return chalkModule;
+    }
+  } catch {
+    // Fall through to the local ANSI implementation when npm deps are absent.
+  }
+  return createFallbackChalk();
+}
+
+const chalk = loadChalk();
 
 const makeColor = hex => text => chalk.hex(hex)(String(text));
 const makeBoldColor = hex => text => chalk.hex(hex).bold(String(text));
