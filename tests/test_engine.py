@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hedge_fund.backtesting.engine import BacktestEngine, BacktestResult, Trade, serialize_backtest_result
 from hedge_fund.backtesting.reporter import format_backtest_report
+from hedge_fund.tools.run_backtest import execute_backtest, run_backtest
 
 
 def _candle(
@@ -196,3 +199,20 @@ def test_format_backtest_report_returns_non_empty_string() -> None:
     assert report
     assert "Best Trades" in report
     assert "Worst Trades" in report
+
+
+def test_execute_backtest_handles_empty_dates() -> None:
+    payload = execute_backtest(pair="EURUSD")
+
+    assert payload["ok"] is True
+    assert payload["backtest"]["pair"] == "EURUSD"
+    assert payload["backtest"]["from_date"]
+    assert payload["backtest"]["to_date"]
+
+
+def test_run_backtest_tool_handles_empty_dates() -> None:
+    raw_payload = run_backtest.invoke({"pair": "EURUSD"})
+    payload = json.loads(raw_payload)
+
+    assert payload["ok"] is True
+    assert payload["report"]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from langchain.tools import tool
@@ -10,8 +10,40 @@ from hedge_fund.backtesting.engine import BacktestEngine, serialize_backtest_res
 from hedge_fund.backtesting.reporter import format_backtest_report
 
 
+def _normalize_date_range(granularity: str, from_date: str, to_date: str, candle_count: int = 200) -> tuple[str, str]:
+    step = _granularity_step(granularity)
+    today = datetime.now(tz=UTC).date()
+    resolved_to = datetime.fromisoformat(to_date).date() if to_date else today
+
+    if from_date:
+        resolved_from = datetime.fromisoformat(from_date).date()
+    else:
+        total_span = step * max(candle_count - 1, 0)
+        resolved_from = (datetime.combine(resolved_to, datetime.min.time()) - total_span).date()
+
+    if not to_date:
+        total_span = step * max(candle_count - 1, 0)
+        resolved_to = (datetime.combine(resolved_from, datetime.min.time()) + total_span).date()
+
+    return resolved_from.isoformat(), resolved_to.isoformat()
+
+
+def _granularity_step(granularity: str) -> timedelta:
+    normalized = (granularity or "H1").strip().upper()
+    mapping = {
+        "M5": timedelta(minutes=5),
+        "M15": timedelta(minutes=15),
+        "M30": timedelta(minutes=30),
+        "H1": timedelta(hours=1),
+        "H4": timedelta(hours=4),
+        "D1": timedelta(days=1),
+    }
+    return mapping.get(normalized, timedelta(hours=1))
+
+
 def _stub_candle_loader(pair: str, granularity: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
-    start = datetime.fromisoformat(f"{from_date}T00:00:00")
+    resolved_from_date, _ = _normalize_date_range(granularity, from_date, to_date)
+    start = datetime.fromisoformat(f"{resolved_from_date}T00:00:00")
     is_xau = pair == "XAUUSD"
     base_price = 2900.0 if is_xau else 1.1000
     drift_step = 0.6 if is_xau else 0.0006
@@ -79,6 +111,7 @@ def run_backtest_payload(
     candle_loader: Callable[[str, str, str, str], list[dict[str, Any]]] | None = None,
     signal_detector: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
+    resolved_from_date, resolved_to_date = _normalize_date_range(granularity, from_date, to_date)
     engine = BacktestEngine(
         candle_loader or _stub_candle_loader,
         signal_detector or _stub_signal_detector,
@@ -86,8 +119,8 @@ def run_backtest_payload(
     result = engine.run(
         pair=pair,
         granularity=granularity,
-        from_date=from_date,
-        to_date=to_date,
+        from_date=resolved_from_date,
+        to_date=resolved_to_date,
         account_size=account_size,
         risk_pct=risk_pct,
     )
