@@ -6,8 +6,10 @@ from typing import Any, Callable
 
 from langchain.tools import tool
 
+from analysis.signals import detect_all_signals
 from hedge_fund.backtesting.engine import BacktestEngine, serialize_backtest_result
 from hedge_fund.backtesting.reporter import format_backtest_report
+from tools.data_cache import load_candles
 
 
 def _normalize_date_range(granularity: str, from_date: str, to_date: str, candle_count: int = 200) -> tuple[str, str]:
@@ -41,66 +43,6 @@ def _granularity_step(granularity: str) -> timedelta:
     return mapping.get(normalized, timedelta(hours=1))
 
 
-def _stub_candle_loader(pair: str, granularity: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
-    resolved_from_date, _ = _normalize_date_range(granularity, from_date, to_date)
-    start = datetime.fromisoformat(f"{resolved_from_date}T00:00:00")
-    is_xau = pair == "XAUUSD"
-    base_price = 2900.0 if is_xau else 1.1000
-    drift_step = 0.6 if is_xau else 0.0006
-    noise = 1.0 if is_xau else 0.0010
-    precision = 2 if is_xau else 5
-    candles: list[dict[str, Any]] = []
-
-    for index in range(200):
-        drift = drift_step * index
-        wave = noise * (1 if index % 10 < 5 else -0.8)
-        close = base_price + drift + wave
-        open_price = close - (0.4 if is_xau else 0.0004)
-        high = max(open_price, close) + noise
-        low = min(open_price, close) - noise
-        candles.append(
-            {
-                "time": (start + timedelta(hours=index)).isoformat(),
-                "open": round(open_price, precision),
-                "high": round(high, precision),
-                "low": round(low, precision),
-                "close": round(close, precision),
-                "volume": 1000 + index,
-                "pair": pair,
-                "granularity": granularity,
-            }
-        )
-    return candles
-
-
-def _stub_signal_detector(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    anchor_indexes = [20, 50, 80, 110, 140]
-    signals: list[dict[str, Any]] = []
-
-    for anchor in anchor_indexes:
-        if len(candles) <= anchor:
-            continue
-        candle = candles[anchor]
-        is_xau = candle["pair"] == "XAUUSD"
-        zone_size = 0.8 if is_xau else 0.0008
-        precision = 2 if is_xau else 5
-        close = float(candle["close"])
-        signals.append(
-            {
-                "type": "fvg_fib_liquidity",
-                "direction": "long" if anchor % 2 == 0 else "short",
-                "zone_high": round(close + zone_size, precision),
-                "zone_low": round(close, precision),
-                "candle_time": str(candle["time"]),
-                "pair": candle["pair"],
-                "granularity": candle["granularity"],
-                "strength": 0.8,
-            }
-        )
-
-    return signals
-
-
 def run_backtest_payload(
     pair: str,
     granularity: str = "H1",
@@ -113,8 +55,8 @@ def run_backtest_payload(
 ) -> dict[str, Any]:
     resolved_from_date, resolved_to_date = _normalize_date_range(granularity, from_date, to_date)
     engine = BacktestEngine(
-        candle_loader or _stub_candle_loader,
-        signal_detector or _stub_signal_detector,
+        candle_loader=candle_loader or load_candles,
+        signal_detector=signal_detector or detect_all_signals,
     )
     result = engine.run(
         pair=pair,
