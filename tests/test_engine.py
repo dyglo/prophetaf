@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -201,7 +202,9 @@ def test_format_backtest_report_returns_non_empty_string() -> None:
     assert "Worst Trades" in report
 
 
-def test_execute_backtest_handles_empty_dates() -> None:
+@patch("hedge_fund.tools.run_backtest.load_candles", return_value=[])
+@patch("hedge_fund.tools.run_backtest.detect_all_signals", return_value=[])
+def test_execute_backtest_handles_empty_dates(mock_signals, mock_candles) -> None:
     payload = execute_backtest(pair="EURUSD")
 
     assert payload["ok"] is True
@@ -210,7 +213,9 @@ def test_execute_backtest_handles_empty_dates() -> None:
     assert payload["backtest"]["to_date"]
 
 
-def test_run_backtest_tool_handles_empty_dates() -> None:
+@patch("hedge_fund.tools.run_backtest.load_candles", return_value=[])
+@patch("hedge_fund.tools.run_backtest.detect_all_signals", return_value=[])
+def test_run_backtest_tool_handles_empty_dates(mock_signals, mock_candles) -> None:
     raw_payload = run_backtest.invoke({"pair": "EURUSD"})
     payload = json.loads(raw_payload)
 
